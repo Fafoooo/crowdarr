@@ -50,6 +50,7 @@ async def test_qbit_authenticated_webui_request_shapes_and_health(
                         "hash": "deadbeef",
                         "name": "Release-GROUP",
                         "category": "cross-seed-link",
+                        "save_path": "/data/cross-seeds",
                         "content_path": "/data/cross-seeds/Release-GROUP",
                         "progress": 0.999,
                         "state": "stalledDL",
@@ -102,6 +103,7 @@ async def test_qbit_authenticated_webui_request_shapes_and_health(
         health = await connector.healthcheck()
 
     assert torrents[0].torrent_hash == "deadbeef"
+    assert torrents[0].save_path == "/data/cross-seeds"
     assert torrents[0].local_content_path == data_root / "cross-seeds/Release-GROUP"
     assert files[0].index == 4 and files[0].path == "Release-GROUP.nfo"
     assert health.healthy is True and health.version == "v5.0.4"

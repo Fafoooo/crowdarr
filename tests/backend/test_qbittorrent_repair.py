@@ -63,6 +63,40 @@ def test_detects_incomplete_nfo_only_when_video_is_nearly_complete() -> None:
     )
 
 
+def test_multifile_paths_are_rooted_at_qbittorrent_save_path() -> None:
+    torrent = TorrentSnapshot(
+        torrent_hash="deadbeef",
+        name="Release.Name.2026-GROUP",
+        category="cross-seed-link",
+        save_path="/data/cross-seeds",
+        content_path="/data/cross-seeds/Release.Name",
+        progress=0.999,
+        state="stalledDL",
+        files=[
+            TorrentFile(
+                index=7,
+                path="Release.Name/Release.Name.nfo",
+                size=42_000,
+                progress=0.0,
+                priority=0,
+            ),
+            TorrentFile(
+                index=8,
+                path="Release.Name/Release.Name.mkv",
+                size=VIDEO_SIZE,
+                progress=0.9999,
+                priority=1,
+            ),
+        ],
+    )
+
+    missing = find_stuck_nfos(torrent)
+
+    assert missing[0].reported_path == PurePosixPath(
+        "/data/cross-seeds/Release.Name/Release.Name.nfo"
+    )
+
+
 @pytest.mark.parametrize(
     "snapshot",
     [
