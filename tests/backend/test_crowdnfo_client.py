@@ -256,6 +256,34 @@ async def test_get_retries_transient_connection_errors_with_backoff() -> None:
 
 
 @pytest.mark.asyncio
+async def test_request_pacing_uses_the_injected_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+    clock = iter((0.0, 0.0, 0.1, 0.5))
+
+    async def injected_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def unexpected_sleep(_delay: float) -> None:
+        raise AssertionError("request pacing bypassed the injected sleep")
+
+    monkeypatch.setattr("backend.crowdnfo.client.asyncio.sleep", unexpected_sleep)
+    async with httpx.AsyncClient() as http_client:
+        client = CrowdNFOClient(
+            base_url="https://crowdnfo.example",
+            http_client=http_client,
+            request_interval=1.0,
+            sleep=injected_sleep,
+            monotonic=lambda: next(clock),
+        )
+        await client._pace_request()  # noqa: SLF001
+        await client._pace_request()  # noqa: SLF001
+
+    assert delays == [pytest.approx(0.9)]
+
+
+@pytest.mark.asyncio
 async def test_crowdnfo_bounds_parallel_get_requests() -> None:
     active = 0
     maximum_active = 0
