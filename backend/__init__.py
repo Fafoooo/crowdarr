@@ -1,1 +1,1 @@
-"""Crowdarrr backend package."""
+"""crowdarr backend package."""

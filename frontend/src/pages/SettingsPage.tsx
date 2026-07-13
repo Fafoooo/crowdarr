@@ -235,6 +235,7 @@ function normaliseSettings(raw: unknown): SettingsData {
     mismatch_policy: value.nfo_mismatch_policy === "remove" ? "remove" : "keep",
     path_mappings: normalisePathMappings(value.path_mappings),
     recheck_after_repair: booleanValue(value.auto_recheck, true),
+    recheck_timeout_seconds: numberValue(value.recheck_timeout_seconds, 1800),
   };
 }
 
@@ -508,6 +509,7 @@ function buildPayload(
         remote_root: connector_path,
       }),
     ),
+    recheck_timeout_seconds: settings.recheck_timeout_seconds,
     qbittorrent: buildConnectorPayload(settings.connectors.qbittorrent, {
       field: "password",
       value: secrets.qbittorrent_password,
@@ -534,6 +536,7 @@ export default function SettingsPage() {
   const [loadError, setLoadError] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const [feedback, setFeedback] = useState<string>();
+  const [feedbackWarning, setFeedbackWarning] = useState(false);
   const [pendingTest, setPendingTest] = useState<ConnectorId>();
   const [saving, setSaving] = useState(false);
 
@@ -578,6 +581,7 @@ export default function SettingsPage() {
     setPendingTest(id);
     setActionError(undefined);
     setFeedback(undefined);
+    setFeedbackWarning(false);
     try {
       const draft = settings
         ? buildConnectorTestPayload(id, settings, secrets)
@@ -589,10 +593,11 @@ export default function SettingsPage() {
           method: "POST",
         },
       );
-      if (response.status !== "healthy") {
+      if (response.status !== "healthy" && response.status !== "degraded") {
         setActionError(`${label}: ${response.message || response.status}`);
         return;
       }
+      setFeedbackWarning(response.status === "degraded");
       setFeedback(
         `${response.message}${response.latency_ms == null ? "" : ` · ${response.latency_ms} ms`}`,
       );
@@ -609,6 +614,7 @@ export default function SettingsPage() {
     setSaving(true);
     setActionError(undefined);
     setFeedback(undefined);
+    setFeedbackWarning(false);
     try {
       const response = await apiRequest<unknown>("/api/settings", {
         body: JSON.stringify(buildPayload(settings, secrets)),
@@ -679,7 +685,11 @@ export default function SettingsPage() {
 
       {feedback ? (
         <div
-          className="flex items-center gap-2 rounded-xl border border-emerald-400/20 bg-emerald-400/[0.08] px-4 py-3 text-sm text-emerald-200"
+          className={`flex items-center gap-2 rounded-xl border px-4 py-3 text-sm ${
+            feedbackWarning
+              ? "border-amber-400/20 bg-amber-400/[0.08] text-amber-200"
+              : "border-emerald-400/20 bg-emerald-400/[0.08] text-emerald-200"
+          }`}
           role="status"
         >
           <CheckIcon className="size-4" />
@@ -796,7 +806,7 @@ export default function SettingsPage() {
             <div className="rounded-2xl border border-white/[0.07] bg-zinc-900/70 p-5 shadow-panel">
               <h2 className="font-semibold text-zinc-100">Automation modes</h2>
               <p className="mt-1 text-xs text-zinc-500">
-                Choose when Crowdarrr downloads and contributes NFO data.
+                Choose when crowdarr downloads and contributes NFO data.
               </p>
               <div className="mt-5 space-y-4">
                 <Field id="download-mode" label="Download mode">
@@ -930,6 +940,22 @@ export default function SettingsPage() {
                     value={settings.backfill_cron}
                   />
                 </Field>
+                <Field id="recheck-timeout" label="Recheck timeout (seconds)">
+                  <input
+                    className={inputClassName}
+                    id="recheck-timeout"
+                    max="86400"
+                    min="60"
+                    onChange={(event) =>
+                      update((current) => ({
+                        ...current,
+                        recheck_timeout_seconds: Number(event.target.value),
+                      }))
+                    }
+                    type="number"
+                    value={settings.recheck_timeout_seconds}
+                  />
+                </Field>
                 <div className="flex items-end">
                   <Toggle
                     checked={settings.dry_run}
@@ -987,7 +1013,7 @@ export default function SettingsPage() {
                 <div>
                   <h2 className="font-semibold text-zinc-100">Path mappings</h2>
                   <p className="mt-1 text-xs text-zinc-500">
-                    Translate connector paths into Crowdarrr-visible paths.
+                    Translate connector paths into crowdarr-visible paths.
                   </p>
                 </div>
                 <Button
@@ -1031,7 +1057,7 @@ export default function SettingsPage() {
                     </Field>
                     <Field
                       id={`local-path-${index}`}
-                      label={`Crowdarrr path ${index + 1}`}
+                      label={`crowdarr path ${index + 1}`}
                     >
                       <input
                         className={inputClassName}

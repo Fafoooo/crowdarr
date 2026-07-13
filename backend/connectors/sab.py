@@ -67,10 +67,22 @@ class SABLiveService(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class SABLiveActionResult:
+    """Describe whether a live action changed state and may be finalized."""
+
+    performed: bool
+    terminal: bool = True
+    value: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SABWebhookResult:
     accepted: bool
     actions: tuple[str, ...] = ()
     errors: Mapping[str, str] = field(default_factory=dict)
+    # None preserves the pre-v0.1.3 contract: successful attempted actions count.
+    performed_actions: tuple[str, ...] | None = None
+    deferred_actions: tuple[str, ...] = ()
 
 
 class SABnzbdConnector:
@@ -189,6 +201,8 @@ class SABWebhookHandler:
 
     async def handle(self, event: SABCompletionEvent) -> SABWebhookResult:
         actions: list[str] = []
+        performed_actions: list[str] = []
+        deferred_actions: list[str] = []
         errors: dict[str, str] = {}
         operations = (
             ("fetch", self._fetch_enabled, self._live_service.fetch_missing),
@@ -199,15 +213,26 @@ class SABWebhookHandler:
                 continue
             actions.append(name)
             try:
-                await operation(event)
+                operation_result = await operation(event)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 safe_error = sanitized_error(error)
                 errors[name] = safe_error
                 LOGGER.warning("SABnzbd %s step failed (%s)", name, safe_error)
+            else:
+                if isinstance(operation_result, SABLiveActionResult):
+                    if operation_result.performed:
+                        performed_actions.append(name)
+                    if not operation_result.terminal:
+                        deferred_actions.append(name)
+                else:
+                    # Third-party/legacy services only signalled failure by raising.
+                    performed_actions.append(name)
         return SABWebhookResult(
             accepted=True,
             actions=tuple(actions),
             errors=errors,
+            performed_actions=tuple(performed_actions),
+            deferred_actions=tuple(deferred_actions),
         )

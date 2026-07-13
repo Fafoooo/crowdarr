@@ -50,7 +50,7 @@ class UmlautAdaptarrConnector:
         try:
             response = await self._http.get(
                 f"{self._base_url}/titlelookup",
-                params={"changedTitle": "crowdarrr-healthcheck"},
+                params={"changedTitle": "crowdarr-healthcheck"},
             )
             if response.status_code not in {200, 404}:
                 response.raise_for_status()

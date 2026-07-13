@@ -20,6 +20,7 @@ from backend.connectors.health import (
 from backend.connectors.radarr import RadarrConnector
 from backend.connectors.sab import (
     SABCompletionEvent,
+    SABLiveActionResult,
     SABnzbdConnector,
     SABWebhookHandler,
 )
@@ -472,6 +473,28 @@ async def test_sab_webhook_reports_no_actions_when_both_modes_are_disabled() -> 
     result = await handler.handle(SABCompletionEvent("Release", "/data/Release"))
 
     assert result.actions == () and result.errors == {}
+
+
+class _OutcomeLiveService:
+    async def fetch_missing(self, _event: SABCompletionEvent) -> SABLiveActionResult:
+        return SABLiveActionResult(performed=False, value=Path("existing.nfo"))
+
+    async def contribute(self, _event: SABCompletionEvent) -> SABLiveActionResult:
+        return SABLiveActionResult(performed=True, value=object())
+
+
+@pytest.mark.asyncio
+async def test_sab_webhook_distinguishes_noop_from_performed_actions() -> None:
+    handler = SABWebhookHandler(
+        live_service=_OutcomeLiveService(),
+        fetch_enabled=True,
+        contribute_enabled=True,
+    )
+
+    result = await handler.handle(SABCompletionEvent("Release", "/data/Release"))
+
+    assert result.actions == ("fetch", "contribute")
+    assert result.performed_actions == ("contribute",)
 
 
 @pytest.mark.asyncio

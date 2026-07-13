@@ -47,6 +47,7 @@ const dashboardResponse = {
     fetched: 37,
     matches: 51,
     misses: 4,
+    placed: 21,
     repaired: 9,
     uploaded: 14,
   },
@@ -75,8 +76,13 @@ const dashboardResponse = {
       category: "cross-seed-link",
       hash: "0123456789abcdef",
       missing_nfo_path: "Sample.Release-GROUP/release.nfo",
+      missing_nfo_count: 1,
       name: "Sample.Release-GROUP",
       progress: 0.999,
+      reason: "ready",
+      repair_outcome: "ready",
+      repairable: true,
+      state: "stalledDL",
     },
   ],
 };
@@ -123,13 +129,12 @@ describe("dashboard", () => {
     expect(within(health).getByText("Authentication required")).toBeVisible();
     expect(within(health).getByText("Not configured")).toBeVisible();
 
-    const metrics = screen.getByRole("region", { name: /lifetime counters/i });
+    const metrics = screen.getByRole("region", { name: /repair funnel/i });
     for (const [label, value] of [
-      ["NFOs fetched", "37"],
-      ["Torrents repaired", "9"],
-      ["Uploads completed", "14"],
       ["CrowdNFO matches", "51"],
-      ["CrowdNFO misses", "4"],
+      ["NFOs fetched", "37"],
+      ["NFOs placed", "21"],
+      ["Verified repairs", "9"],
     ]) {
       const metric = within(metrics).getByRole("group", { name: label });
       expect(within(metric).getByText(value)).toBeVisible();
@@ -145,7 +150,7 @@ describe("dashboard", () => {
     const stuck = screen.getByRole("region", {
       name: /incomplete qBittorrent torrents/i,
     });
-    const torrentRow = within(stuck).getByRole("row", {
+    const torrentRow = within(stuck).getByRole("article", {
       name: /Sample\.Release-GROUP/i,
     });
     expect(within(torrentRow).getByText("99.9%")).toBeVisible();
@@ -170,6 +175,7 @@ describe("dashboard", () => {
             name: "Ready.Release-GROUP",
             progress: 0.999,
             reason: "ready",
+            repair_outcome: "ready",
             repairable: true,
             state: "stalledDL",
           },
@@ -181,6 +187,7 @@ describe("dashboard", () => {
             name: "Video.Incomplete-GROUP",
             progress: 0.75,
             reason: "video_incomplete",
+            repair_outcome: "not_applicable",
             repairable: false,
             state: "stoppedDL",
           },
@@ -192,6 +199,7 @@ describe("dashboard", () => {
             name: "No.Incomplete.NFO-GROUP",
             progress: 0.98,
             reason: "no_incomplete_nfo",
+            repair_outcome: "not_applicable",
             repairable: false,
             state: "stalledDL",
           },
@@ -206,6 +214,10 @@ describe("dashboard", () => {
     });
     expect(
       within(torrents).getByText(/1 repairable.*3 incomplete/i),
+    ).toBeVisible();
+    expect(within(torrents).getByText("NFO repair queue")).toBeVisible();
+    expect(
+      within(torrents).getByText("Other incomplete downloads"),
     ).toBeVisible();
     expect(within(torrents).getByText("2 NFO files")).toBeVisible();
     expect(
@@ -254,7 +266,13 @@ describe("dashboard", () => {
       "GET /api/jobs/repair-9": jsonResponse({
         job_id: "repair-9",
         kind: "repair_torrent",
-        result: {},
+        result: {
+          message: "Sample.Release-GROUP was verified at 100%",
+          outcome: "fixed",
+          release_name: "Sample.Release-GROUP",
+          retryable: false,
+          torrent_hash: "0123456789abcdef",
+        },
         status: "success",
       }),
       "POST /api/actions/misses/miss-7/retry": () => {
@@ -337,10 +355,10 @@ describe("dashboard", () => {
     const miss = {
       created_at: "2026-07-13T09:00:00Z",
       id: "activity-miss",
-      message: "not found",
+      message: "Sample.Release-GROUP: CrowdNFO lookup returned not found",
       miss_id: "miss-new",
       status: "warning",
-      title: "CrowdNFO miss",
+      title: "Sample.Release-GROUP",
       type: "miss",
     };
     installFetchMock({
@@ -352,6 +370,15 @@ describe("dashboard", () => {
             : {
                 ...dashboardResponse,
                 recent_activity: [miss, ...dashboardResponse.recent_activity],
+                stuck_torrents: dashboardResponse.stuck_torrents.map(
+                  (torrent) => ({
+                    ...torrent,
+                    repair_message:
+                      "Sample.Release-GROUP is not currently available in CrowdNFO",
+                    repair_outcome: "not_available",
+                    retryable: false,
+                  }),
+                ),
               },
         );
       },
@@ -362,8 +389,15 @@ describe("dashboard", () => {
       "GET /api/jobs/repair-miss": jsonResponse({
         job_id: "repair-miss",
         kind: "repair_torrent",
-        result: {},
-        status: "failed",
+        result: {
+          message:
+            "Sample.Release-GROUP is not currently available in CrowdNFO",
+          outcome: "not_available",
+          release_name: "Sample.Release-GROUP",
+          retryable: false,
+          torrent_hash: "0123456789abcdef",
+        },
+        status: "skipped",
       }),
     });
     const user = userEvent.setup();
@@ -376,12 +410,78 @@ describe("dashboard", () => {
       }),
     );
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      /repair failed.*recent activity/i,
+    const missStatus = await screen.findByRole("status");
+    expect(missStatus).toHaveTextContent(
+      /not currently available in CrowdNFO/i,
     );
-    expect(await screen.findByText("CrowdNFO miss")).toBeVisible();
-    expect(screen.getByText("not found")).toBeVisible();
+    expect(missStatus).toHaveClass("text-amber-200");
+    expect(await screen.findByText("Not in CrowdNFO")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: /not available.*Sample\.Release/i }),
+    ).toBeDisabled();
+    expect(screen.getAllByText("Sample.Release-GROUP").length).toBeGreaterThan(
+      0,
+    );
+    expect(screen.getByText(/lookup returned not found/i)).toBeVisible();
     expect(dashboardRequests).toBe(2);
+  });
+
+  it("keeps transient fetch failures retryable inline", async () => {
+    let dashboardRequests = 0;
+    installFetchMock({
+      "GET /api/dashboard": () => {
+        dashboardRequests += 1;
+        return jsonResponse(
+          dashboardRequests === 1
+            ? dashboardResponse
+            : {
+                ...dashboardResponse,
+                stuck_torrents: dashboardResponse.stuck_torrents.map(
+                  (torrent) => ({
+                    ...torrent,
+                    repair_message:
+                      "Sample.Release-GROUP: CrowdNFO connection failed; retry is safe",
+                    repair_outcome: "fetch_failed",
+                    retryable: true,
+                  }),
+                ),
+              },
+        );
+      },
+      "POST /api/torrents/0123456789abcdef/repair": jsonResponse(
+        { job_id: "repair-transient", status: "accepted" },
+        { status: 202 },
+      ),
+      "GET /api/jobs/repair-transient": jsonResponse({
+        job_id: "repair-transient",
+        kind: "repair_torrent",
+        result: {
+          message:
+            "Sample.Release-GROUP: CrowdNFO connection failed; retry is safe",
+          outcome: "fetch_failed",
+          release_name: "Sample.Release-GROUP",
+          retryable: true,
+          torrent_hash: "0123456789abcdef",
+        },
+        status: "failed",
+      }),
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+    await user.click(
+      await screen.findByRole("button", {
+        name: /repair Sample\.Release-GROUP/i,
+      }),
+    );
+
+    expect(await screen.findByText("Fetch failed – retry")).toBeVisible();
+    expect(
+      screen.getByRole("button", {
+        name: /retry repair Sample\.Release-GROUP/i,
+      }),
+    ).toBeEnabled();
+    expect(screen.getByRole("alert")).toHaveTextContent(/connection failed/i);
   });
 
   it("keeps all primary destinations keyboard-accessible in the compact shell", async () => {

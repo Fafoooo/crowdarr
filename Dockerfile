@@ -21,7 +21,7 @@ COPY backend/ ./backend/
 RUN --mount=type=cache,target=/root/.cache/pip pip install .
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
-LABEL org.opencontainers.image.title="Crowdarrr" \
+LABEL org.opencontainers.image.title="crowdarr" \
       org.opencontainers.image.description="Self-hosted CrowdNFO companion for download clients and media libraries" \
       org.opencontainers.image.licenses="MIT"
 
@@ -31,20 +31,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PUID=1000 \
     PGID=1000 \
     UMASK=0022 \
-    TZ=Etc/UTC \
-    CROWDARRR_HOST=0.0.0.0 \
-    CROWDARRR_PORT=8000 \
-    CROWDARRR_DATA_DIR=/config \
-    CROWDARRR_FRONTEND_DIR=/app/frontend/dist \
-    CROWDARRR_LOG_LEVEL=info
+    TZ=Etc/UTC
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates gosu mediainfo tini tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 1000 crowdarrr \
-    && useradd --uid 1000 --gid crowdarrr --home-dir /config --no-create-home --shell /usr/sbin/nologin crowdarrr \
+    && groupadd --gid 1000 crowdarr \
+    && useradd --uid 1000 --gid crowdarr --home-dir /config --no-create-home --shell /usr/sbin/nologin crowdarr \
     && mkdir -p /app/frontend/dist /config \
-    && chown -R crowdarrr:crowdarrr /config
+    && chown -R crowdarr:crowdarr /config
 
 WORKDIR /app
 COPY --from=python-builder /opt/venv /opt/venv
@@ -55,7 +50,7 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 EXPOSE 8000
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD ["python", "-c", "import os, urllib.request; u=f\"http://127.0.0.1:{os.environ.get('CROWDARRR_PORT', '8000')}/api/health\"; urllib.request.urlopen(u, timeout=3).read()"]
+  CMD ["python", "-c", "import os, urllib.request; p=os.environ.get('CROWDARR_PORT', os.environ.get('CROWDARRR_PORT', '8000')); urllib.request.urlopen(f'http://127.0.0.1:{p}/api/health', timeout=3).read()"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["serve"]

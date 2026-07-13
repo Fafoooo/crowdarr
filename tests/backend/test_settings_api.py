@@ -37,6 +37,7 @@ async def test_settings_defaults_are_complete_generic_and_persisted(
     assert str(settings.crowdnfo.base_url).rstrip("/") == "https://crowdnfo.net"
     assert settings.download_mode is DownloadMode.OFF
     assert settings.auto_recheck is True
+    assert settings.recheck_timeout_seconds == 1800
     assert settings.nfo_mismatch_policy is MismatchCleanupPolicy.KEEP
     assert settings.contribute.enabled is False
     assert settings.match_strategy == "hash_then_release_name"
@@ -157,6 +158,7 @@ def test_runtime_composition_forwards_recheck_and_mismatch_settings(
             },
             "path_mappings": [{"remote_root": "/data", "local_root": str(media_root)}],
             "auto_recheck": False,
+            "recheck_timeout_seconds": 2400,
             "nfo_mismatch_policy": "remove",
             "dry_run": False,
         }
@@ -169,6 +171,7 @@ def test_runtime_composition_forwards_recheck_and_mismatch_settings(
     services._compose_bundle(settings)
 
     assert captured["auto_recheck"] is False
+    assert captured["recheck_timeout"] == 2400
     assert captured["keep_mismatch"] is False
 
 

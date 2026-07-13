@@ -1,7 +1,7 @@
 # Opt-in LXC/macvlan reference deployment
 
 This profile reproduces one operator's environment without making it the project
-default. All credentials remain blank and the Crowdarrr IP must be checked for
+default. All credentials remain blank and the crowdarr IP must be checked for
 availability. General installations should start with
 `docker-compose.example.yml`.
 
@@ -46,12 +46,12 @@ gateway, interface, DHCP pool, and LXC macvlan permissions first.
 ```bash
 cp .env.example .env
 mkdir -p config
-# Edit CROWDARRR_MACVLAN_IP to an unused 10.10.3.x address.
+# Edit CROWDARR_MACVLAN_IP to an unused 10.10.3.x address.
 docker compose -f docker-compose.macvlan.example.yml up -d --build
 ```
 
-The profile refuses to start until `CROWDARRR_MACVLAN_IP` is set. The service has
-no host port publication because its own LAN IP exposes `CROWDARRR_PORT`
+The profile refuses to start until `CROWDARR_MACVLAN_IP` is set. The service has
+no host port publication because its own LAN IP exposes `CROWDARR_PORT`
 directly.
 
 ## Configure the UI
@@ -60,7 +60,7 @@ Use these values as a starting point:
 
 - CrowdNFO base URL: `https://crowdnfo.net`; paste a profile API key in the UI.
 - qBittorrent URL: `http://10.10.3.22:8080`; leave credentials blank only if its
-  WebUI auth whitelist genuinely covers the Crowdarrr macvlan address.
+  WebUI auth whitelist genuinely covers the crowdarr macvlan address.
 - Radarr URL: `http://10.10.3.18:7878`; add its v3 API key.
 - Sonarr URL: `http://10.10.3.18:8989`; add its v3 API key.
 - SABnzbd: add its actual LAN URL and API key.
@@ -69,20 +69,20 @@ Use these values as a starting point:
 - Path mapping: remote `/data` to local `/data`.
 
 Start with dry-run, test each connector, and scan manually before enabling the
-backfill schedule. Category mappings in Crowdarrr describe media categories;
+backfill schedule. Category mappings in crowdarr describe media categories;
 qBittorrent remains responsible for category-to-save-path behavior.
 
 ## Macvlan caveat
 
 Linux normally prevents direct communication between a macvlan parent host and
-its child containers. Other LAN devices can reach Crowdarrr, but the Docker host
+its child containers. Other LAN devices can reach crowdarr, but the Docker host
 may need an explicitly configured macvlan shim. Do not work around this by
 silently switching the service to host networking.
 
 ## Why there is no VPN sidecar
 
-Crowdarrr does not download media or contact trackers. It makes small,
+crowdarr does not download media or contact trackers. It makes small,
 authenticated HTTPS requests to CrowdNFO and calls connector APIs on the LAN.
 Torrent/Usenet traffic remains inside qBittorrent and SABnzbd, where any VPN
-policy belongs. A VPN is therefore not required for Crowdarrr; operators can
+policy belongs. A VPN is therefore not required for crowdarr; operators can
 still route it through one if their own policy demands it.

@@ -13,6 +13,7 @@ export interface DashboardCounters {
   fetched: number;
   matches: number;
   misses: number;
+  placed: number;
   repaired: number;
   uploaded: number;
 }
@@ -42,6 +43,19 @@ export interface StuckTorrent {
     | "invalid_nfo_path"
     | "inspection_failed";
   repairable: boolean;
+  repair_message?: string;
+  repair_outcome:
+    | "ready"
+    | "fixed"
+    | "not_available"
+    | "fetch_failed"
+    | "verification_pending"
+    | "placed"
+    | "verified_incomplete"
+    | "mismatch"
+    | "dry_run"
+    | "not_applicable";
+  retryable: boolean;
   state: string;
 }
 
@@ -62,7 +76,14 @@ export interface ActionResponse {
 export interface JobResponse {
   job_id: string;
   kind: string;
-  result: { detail?: string };
+  result: {
+    detail?: string;
+    message?: string;
+    outcome?: StuckTorrent["repair_outcome"];
+    release_name?: string;
+    retryable?: boolean;
+    torrent_hash?: string;
+  };
   status:
     | "queued"
     | "running"
@@ -125,6 +146,7 @@ export interface SettingsData {
   mismatch_policy: "keep" | "remove";
   path_mappings: PathMapping[];
   recheck_after_repair: boolean;
+  recheck_timeout_seconds: number;
 }
 
 export interface ConnectorTestResponse {

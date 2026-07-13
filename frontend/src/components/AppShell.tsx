@@ -64,7 +64,7 @@ function Brand() {
       </div>
       <div>
         <p className="text-base font-bold tracking-tight text-white">
-          Crowdarrr
+          crowdarr
         </p>
         <p className="flex items-center gap-1.5 text-[11px] text-zinc-500">
           <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgb(52_211_153)]" />
@@ -86,7 +86,7 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const currentPage = pageTitle(pathname);
 
   useEffect(() => {
-    document.title = `${currentPage} · Crowdarrr`;
+    document.title = `${currentPage} · crowdarr`;
     mainRef.current?.querySelector<HTMLHeadingElement>("h1")?.focus();
 
     if (initialPathnameRef.current !== pathname) {

@@ -92,7 +92,7 @@ class TorrentRepairService:
         atomic_writer: AtomicWriter | None = None,
         allowed_roots: Iterable[Path] | None = None,
         poll_interval: float = 2.0,
-        recheck_timeout: float = 300.0,
+        recheck_timeout: float = 1800.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         dry_run: bool = False,

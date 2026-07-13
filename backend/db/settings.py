@@ -55,7 +55,8 @@ class SettingsStore:
                 self._cipher = Fernet(key)
             except (TypeError, ValueError) as error:
                 raise SettingsEncryptionError(
-                    "settings encryption key is invalid; CROWDARRR_MASTER_KEY "
+                    "settings encryption key is invalid; CROWDARR_MASTER_KEY "
+                    "(legacy CROWDARRR_MASTER_KEY) "
                     "must be a URL-safe base64-encoded 32-byte Fernet key. "
                     "Generate it with cryptography.fernet.Fernet.generate_key(); "
                     "do not use secrets.token_urlsafe()."

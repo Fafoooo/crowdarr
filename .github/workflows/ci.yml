@@ -96,25 +96,28 @@ jobs:
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          tags: crowdarrr:ci
+          tags: crowdarr:ci
 
       - name: Smoke-test container health
         shell: bash
         run: |
           set -euo pipefail
-          trap 'docker rm --force crowdarrr-ci >/dev/null 2>&1 || true' EXIT
-          docker run --detach --name crowdarrr-ci crowdarrr:ci
+          trap 'docker rm --force crowdarr-ci >/dev/null 2>&1 || true' EXIT
+          # A legacy-only override proves existing direct `docker run` deployments
+          # are not shadowed by corrected-prefix image defaults.
+          docker run --detach --name crowdarr-ci \
+            --env CROWDARRR_PORT=8123 crowdarr:ci
           for attempt in {1..30}; do
-            status="$(docker inspect --format '{{.State.Health.Status}}' crowdarrr-ci)"
+            status="$(docker inspect --format '{{.State.Health.Status}}' crowdarr-ci)"
             if [[ "$status" == "healthy" ]]; then
               exit 0
             fi
             if [[ "$status" == "unhealthy" ]]; then
-              docker logs crowdarrr-ci
+              docker logs crowdarr-ci
               exit 1
             fi
             echo "Waiting for container health ($attempt/30): $status"
             sleep 2
           done
-          docker logs crowdarrr-ci
+          docker logs crowdarr-ci
           exit 1

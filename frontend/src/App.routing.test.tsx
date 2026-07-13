@@ -37,7 +37,7 @@ async function navigateToSettings() {
 
 describe("client-side route accessibility", () => {
   beforeEach(() => {
-    document.title = "Crowdarrr";
+    document.title = "crowdarr";
     visit("/");
   });
 
@@ -45,7 +45,7 @@ describe("client-side route accessibility", () => {
     const heading = await navigateToSettings();
 
     expect(heading).toBeVisible();
-    expect(document.title).toBe("Settings · Crowdarrr");
+    expect(document.title).toBe("Settings · crowdarr");
   });
 
   it("moves keyboard focus to the new page heading", async () => {

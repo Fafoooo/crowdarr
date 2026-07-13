@@ -1,8 +1,8 @@
-# Crowdarrr implementation plan
+# crowdarr implementation plan
 
 ## Product boundary
 
-Crowdarrr is a single-port, self-hosted companion for CrowdNFO. Every connector,
+crowdarr is a single-port, self-hosted companion for CrowdNFO. Every connector,
 path, category, schedule, credential, and operating mode is optional and stored
 through the web UI. The deployment described by the original requester is an
 example profile only; no private host, subnet, path, or credential is compiled

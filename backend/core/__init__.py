@@ -1,1 +1,1 @@
-"""Crowdarrr domain and filesystem services."""
+"""crowdarr domain and filesystem services."""

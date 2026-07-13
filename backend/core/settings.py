@@ -127,6 +127,7 @@ class AppSettings(StrictModel):
     umlautadaptarr: ConnectorSettings = Field(default_factory=ConnectorSettings)
     download_mode: DownloadMode = DownloadMode.OFF
     auto_recheck: bool = True
+    recheck_timeout_seconds: int = Field(default=1800, ge=60, le=86_400)
     nfo_mismatch_policy: MismatchCleanupPolicy = MismatchCleanupPolicy.KEEP
     contribute: ContributionSettings = Field(default_factory=ContributionSettings)
     match_strategy: Literal[
@@ -154,6 +155,7 @@ class SettingsPatch(StrictModel):
     umlautadaptarr: ConnectorPatch | None = None
     download_mode: DownloadMode | None = None
     auto_recheck: bool | None = None
+    recheck_timeout_seconds: int | None = Field(default=None, ge=60, le=86_400)
     nfo_mismatch_policy: MismatchCleanupPolicy | None = None
     contribute: ContributionPatch | None = None
     match_strategy: (

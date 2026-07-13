@@ -1,4 +1,4 @@
-"""Crowdarrr FastAPI application and single-container SPA entry point."""
+"""crowdarr FastAPI application and single-container SPA entry point."""
 
 from __future__ import annotations
 
@@ -63,9 +63,12 @@ LOGGER = logging.getLogger(__name__)
 _CONNECTOR_NAMES = frozenset(
     {"crowdnfo", "qbittorrent", "sabnzbd", "radarr", "sonarr", "umlautadaptarr"}
 )
-_COUNTER_NAMES = ("fetched", "repaired", "uploaded", "matches", "misses")
+_COUNTER_NAMES = ("fetched", "placed", "repaired", "uploaded", "matches", "misses")
 _SAB_WEBHOOK_PATH = "/api/webhooks/sabnzbd"
-_SAB_WEBHOOK_SECRET_HEADER = "X-Crowdarrr-SAB-Secret"
+_SAB_WEBHOOK_SECRET_HEADERS = (
+    "X-Crowdarr-SAB-Secret",
+    "X-Crowdarrr-SAB-Secret",
+)
 _DEFAULT_SAB_WEBHOOK_MAX_BYTES = 64 * 1024
 
 
@@ -81,6 +84,15 @@ def _positive_int(value: str | None, *, default: int, name: str) -> int:
         LOGGER.warning("Ignoring non-positive %s", name)
         return default
     return parsed
+
+
+def _env(name: str) -> str | None:
+    """Prefer the corrected prefix while preserving every legacy deployment."""
+
+    corrected_name = f"CROWDARR_{name}"
+    if corrected_name in os.environ:
+        return os.environ[corrected_name]
+    return os.getenv(f"CROWDARRR_{name}")
 
 
 class SecurityMiddleware(BaseHTTPMiddleware):
@@ -113,11 +125,15 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         )
 
     def _sab_authorized(self, request: Request) -> bool:
-        credential = request.headers.get(_SAB_WEBHOOK_SECRET_HEADER, "")
-        return bool(
-            credential
-            and self._sab_webhook_secret is not None
+        if self._sab_webhook_secret is None:
+            return False
+        return any(
+            bool(credential)
             and hmac.compare_digest(credential, self._sab_webhook_secret)
+            for credential in (
+                request.headers.get(header, "")
+                for header in _SAB_WEBHOOK_SECRET_HEADERS
+            )
         )
 
     async def dispatch(
@@ -210,18 +226,24 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
 
 class _CrowdNFOHealth:
-    """Verify that the configured profile API key is accepted."""
+    """Probe CrowdNFO without presenting an indeterminate result as authenticated."""
 
     def __init__(self, client: CrowdNFOClient) -> None:
         self._client = client
 
     async def healthcheck(self) -> ConnectorHealth:
         try:
-            await self._client.validate_api_key()
+            verified = await self._client.validate_api_key()
         except asyncio.CancelledError:
             raise
         except Exception as error:
             return ConnectorHealth(False, detail=sanitized_error(error))
+        if not verified:
+            return ConnectorHealth(
+                True,
+                detail="API reachable; profile key could not be verified",
+                degraded=True,
+            )
         return ConnectorHealth(True)
 
 
@@ -383,7 +405,11 @@ class _RuntimeConnectors:
             )
             return {
                 "connector": connector,
-                "status": "healthy" if health.healthy else "unhealthy",
+                "status": (
+                    "degraded"
+                    if health.degraded
+                    else "healthy" if health.healthy else "unhealthy"
+                ),
                 "latency_ms": latency,
                 "message": health.detail or health.version or "healthy",
             }
@@ -460,9 +486,9 @@ class _DefaultServices:
             cache=self.operations,
             max_size_bytes=settings.hash_max_size_bytes,
             max_concurrency=_positive_int(
-                os.getenv("CROWDARRR_HASH_MAX_CONCURRENCY"),
+                _env("HASH_MAX_CONCURRENCY"),
                 default=2,
-                name="CROWDARRR_HASH_MAX_CONCURRENCY",
+                name="CROWDARR_HASH_MAX_CONCURRENCY",
             ),
         )
 
@@ -581,6 +607,13 @@ class _DefaultServices:
                 ],
                 dry_run=settings.dry_run,
                 auto_recheck=settings.auto_recheck,
+                recheck_timeout=float(
+                    _positive_int(
+                        _env("RECHECK_TIMEOUT_SECONDS"),
+                        default=settings.recheck_timeout_seconds,
+                        name="CROWDARR_RECHECK_TIMEOUT_SECONDS",
+                    )
+                ),
                 hash_service=(
                     hash_service
                     if settings.match_strategy != "release_name_only"
@@ -649,7 +682,7 @@ class _DefaultServices:
                     fetch_enabled=fetch_enabled,
                     contribute_enabled=contribute_enabled,
                 )
-            if qbit is not None:
+            if qbit is not None and not settings.dry_run:
                 qbit_poller = QBitCompletedPoller(
                     qbit=qbit,
                     live_service=QBitLiveWorkflow(live_workflow),
@@ -658,9 +691,9 @@ class _DefaultServices:
                     contribute_enabled=contribute_enabled,
                     poll_interval=float(
                         _positive_int(
-                            os.getenv("CROWDARRR_QBIT_POLL_INTERVAL_SECONDS"),
+                            _env("QBIT_POLL_INTERVAL_SECONDS"),
                             default=30,
-                            name="CROWDARRR_QBIT_POLL_INTERVAL_SECONDS",
+                            name="CROWDARR_QBIT_POLL_INTERVAL_SECONDS",
                         )
                     ),
                 )
@@ -668,14 +701,14 @@ class _DefaultServices:
         queue = InProcessActionQueue(
             store=self.store,
             max_concurrency=_positive_int(
-                os.getenv("CROWDARRR_ACTION_MAX_CONCURRENCY"),
+                _env("ACTION_MAX_CONCURRENCY"),
                 default=2,
-                name="CROWDARRR_ACTION_MAX_CONCURRENCY",
+                name="CROWDARR_ACTION_MAX_CONCURRENCY",
             ),
             max_pending=_positive_int(
-                os.getenv("CROWDARRR_ACTION_MAX_PENDING"),
+                _env("ACTION_MAX_PENDING"),
                 default=64,
-                name="CROWDARRR_ACTION_MAX_PENDING",
+                name="CROWDARR_ACTION_MAX_PENDING",
             ),
         )
         runtime = CrowdarrrRuntime(
@@ -692,9 +725,9 @@ class _DefaultServices:
             hash_service=hash_service,
             healthcheck_timeout=float(
                 _positive_int(
-                    os.getenv("CROWDARRR_HEALTHCHECK_TIMEOUT_SECONDS"),
+                    _env("HEALTHCHECK_TIMEOUT_SECONDS"),
                     default=5,
-                    name="CROWDARRR_HEALTHCHECK_TIMEOUT_SECONDS",
+                    name="CROWDARR_HEALTHCHECK_TIMEOUT_SECONDS",
                 )
             ),
         )
@@ -767,14 +800,11 @@ class _DefaultServices:
 
 
 def _default_services() -> _DefaultServices:
-    config_directory = Path(
-        os.getenv(
-            "CROWDARRR_CONFIG_DIR",
-            os.getenv("CROWDARRR_DATA_DIR", "/config"),
-        )
-    )
-    database = config_directory / "crowdarrr.sqlite3"
-    master_key = os.getenv("CROWDARRR_MASTER_KEY") or None
+    config_directory = Path(_env("CONFIG_DIR") or _env("DATA_DIR") or "/config")
+    legacy_database = config_directory / "crowdarrr.sqlite3"
+    corrected_database = config_directory / "crowdarr.sqlite3"
+    database = legacy_database if legacy_database.exists() else corrected_database
+    master_key = _env("MASTER_KEY") or None
     settings = SettingsStore(database, master_key=master_key)
     operations = OperationsStore(database)
     return _DefaultServices(settings=settings, operations=operations)
@@ -824,25 +854,23 @@ def create_app(
                 await owned_services.close()
 
     application = FastAPI(
-        title="Crowdarrr",
-        version="0.1.2",
+        title="crowdarr",
+        version="0.1.3",
         docs_url=None,
         redoc_url=None,
         openapi_url="/api/openapi.json",
         lifespan=lifespan,
     )
-    effective_token = (
-        api_token if api_token is not None else os.getenv("CROWDARRR_API_TOKEN")
-    )
+    effective_token = api_token if api_token is not None else _env("API_TOKEN")
     effective_sab_secret = (
         sab_webhook_secret
         if sab_webhook_secret is not None
-        else os.getenv("CROWDARRR_SAB_WEBHOOK_SECRET")
+        else _env("SAB_WEBHOOK_SECRET")
     )
     sab_webhook_max_bytes = _positive_int(
-        os.getenv("CROWDARRR_SAB_WEBHOOK_MAX_BYTES"),
+        _env("SAB_WEBHOOK_MAX_BYTES"),
         default=_DEFAULT_SAB_WEBHOOK_MAX_BYTES,
-        name="CROWDARRR_SAB_WEBHOOK_MAX_BYTES",
+        name="CROWDARR_SAB_WEBHOOK_MAX_BYTES",
     )
     application.add_middleware(
         SecurityMiddleware,
@@ -872,14 +900,16 @@ def create_app(
             return JSONResponse({"detail": "invalid settings"}, status_code=422)
         except SettingsEncryptionError:
             LOGGER.error(
-                "settings encryption unavailable; verify CROWDARRR_MASTER_KEY "
+                "settings encryption unavailable; verify CROWDARR_MASTER_KEY "
+                "(legacy CROWDARRR_MASTER_KEY) "
                 "and the persisted settings key"
             )
             return JSONResponse(
                 {
                     "detail": (
                         "settings encryption is unavailable; check "
-                        "CROWDARRR_MASTER_KEY and server logs"
+                        "CROWDARR_MASTER_KEY (legacy CROWDARRR_MASTER_KEY) "
+                        "and server logs"
                     )
                 },
                 status_code=503,
@@ -1002,7 +1032,7 @@ def create_app(
         result = logs_service.list(limit=safe_limit)
         return await result if inspect.isawaitable(result) else result
 
-    frontend_override = os.getenv("CROWDARRR_FRONTEND_DIR")
+    frontend_override = _env("FRONTEND_DIR")
     frontend_directory = (
         Path(frontend_override)
         if frontend_override

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -78,14 +79,18 @@ class CrowdNFOClient:
         http_client: httpx.AsyncClient | None = None,
         contract: CrowdNFOContract = DEFAULT_CONTRACT,
         timeout: float = 30.0,
-        max_concurrency: int = 4,
+        max_concurrency: int = 2,
         max_retries: int = 2,
+        request_interval: float = 0.1,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be at least one")
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative")
+        if request_interval < 0:
+            raise ValueError("request_interval cannot be negative")
         self._base_url = self._normalize_base_url(base_url)
         self._api_key = self._secret_value(api_key)
         self._contract = contract
@@ -93,7 +98,22 @@ class CrowdNFOClient:
         self._owns_http = http_client is None
         self._limit = asyncio.Semaphore(max_concurrency)
         self._max_retries = max_retries
+        self._request_interval = request_interval
         self._sleep = sleep
+        self._monotonic = monotonic
+        self._pace_lock = asyncio.Lock()
+        self._last_request_started: float | None = None
+
+    async def _pace_request(self) -> None:
+        if self._request_interval == 0:
+            return
+        async with self._pace_lock:
+            now = self._monotonic()
+            if self._last_request_started is not None:
+                delay = self._request_interval - (now - self._last_request_started)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            self._last_request_started = self._monotonic()
 
     @staticmethod
     def _secret_value(value: str | Any | None) -> str | None:
@@ -138,12 +158,19 @@ class CrowdNFOClient:
         attempts = self._max_retries + 1 if method == "GET" else 1
         async with self._limit:
             for attempt in range(attempts):
-                response = await self._http.request(
-                    method,
-                    self._url(path),
-                    headers=headers,
-                    **kwargs,
-                )
+                await self._pace_request()
+                try:
+                    response = await self._http.request(
+                        method,
+                        self._url(path),
+                        headers=headers,
+                        **kwargs,
+                    )
+                except httpx.RequestError:
+                    if attempt + 1 == attempts:
+                        raise
+                    await self._sleep(0.25 * (2**attempt))
+                    continue
                 if response.status_code != 429 and response.status_code < 500:
                     response.raise_for_status()
                     return response
@@ -214,12 +241,29 @@ class CrowdNFOClient:
             raw=data,
         )
 
-    async def validate_api_key(self) -> None:
-        """Validate the configured profile key against an authenticated route."""
+    async def validate_api_key(self) -> bool:
+        """Probe a route that accepts profile keys.
+
+        The beta API returns the same 404 for missing releases with valid, invalid,
+        and absent profile keys. ``False`` therefore means reachable but not safely
+        verifiable; only an explicit 401/403 is treated as invalid.
+        """
 
         if not self._api_key:
             raise PermissionError("CrowdNFO API key is not configured")
-        await self._request("GET", self._contract.current_user_path)
+        release_name = self._segment("__crowdarr_connection_test__")
+        path = self._contract.best_file_path.format(release_name=release_name)
+        try:
+            await self._request(
+                "GET",
+                path,
+                params={"type": "NFO", "raw": "false", "fallback": "false"},
+            )
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code == 404:
+                return False
+            raise
+        return True
 
     async def download_nfo(
         self,
