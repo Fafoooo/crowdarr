@@ -1,0 +1,968 @@
+"""Application-level orchestration for scans, repair, dashboard, and actions."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Literal, Protocol, cast
+from uuid import uuid4
+
+import httpx
+
+from backend.connectors.health import (
+    ConnectorHealth,
+    ConnectorSupervisor,
+    sanitized_error,
+)
+from backend.connectors.qbit import (
+    MissingNFO,
+    TorrentFile,
+    TorrentSnapshot,
+    find_stuck_nfos,
+)
+from backend.connectors.sab import SABCompletionEvent, SABWebhookResult
+from backend.core.files import atomic_write_bytes
+from backend.core.library import LibraryMediaItem, find_missing_sidecars
+from backend.core.repair import RepairResult, RepairStatus
+from backend.core.scan import ScanTrigger, mode_allows_trigger
+from backend.core.settings import AppSettings
+from backend.db.operations import OperationsStore
+
+LOGGER = logging.getLogger(__name__)
+
+WorkflowStatus = Literal["success", "partial", "failed", "skipped", "dry_run"]
+ConnectorStatus = Literal["healthy", "unhealthy", "degraded", "disabled", "unknown"]
+
+_COUNTER_NAMES = ("fetched", "matches", "misses", "repaired", "uploaded")
+_CONNECTOR_LABELS = {
+    "crowdnfo": "CrowdNFO",
+    "qbittorrent": "qBittorrent",
+    "sabnzbd": "SABnzbd",
+    "radarr": "Radarr",
+    "sonarr": "Sonarr",
+    "umlautadaptarr": "UmlautAdaptarr",
+}
+
+
+class RuntimeStore(Protocol):
+    async def start_job(self, *, action: str, target: str | None = None) -> str: ...
+
+    async def finish_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        detail: str | None = None,
+    ) -> object: ...
+
+    async def increment_counter(self, name: str, amount: int = 1) -> object: ...
+
+    async def record_activity(
+        self,
+        *,
+        activity_type: str,
+        status: str,
+        title: str,
+        message: str,
+        miss_id: str | None = None,
+    ) -> object: ...
+
+    async def record_miss(
+        self,
+        *,
+        source: str,
+        release_name: str,
+        reason: str,
+        retryable: bool,
+    ) -> str: ...
+
+    async def get_counters(self) -> Mapping[str, int]: ...
+
+    async def recent_activity(
+        self, *, limit: int
+    ) -> Sequence[Mapping[str, object]]: ...
+
+
+class QBitRuntimeConnector(Protocol):
+    async def list_torrents(self) -> list[TorrentSnapshot]: ...
+
+    async def list_files(self, torrent_hash: str) -> list[TorrentFile]: ...
+
+    async def get_torrent(self, torrent_hash: str) -> TorrentSnapshot: ...
+
+
+class RepairService(Protocol):
+    async def repair(self, candidate: MissingNFO) -> RepairResult: ...
+
+
+class CrowdNFODownloader(Protocol):
+    async def download_nfo(
+        self,
+        *,
+        release_name: str,
+        media_sha256: str | None = None,
+    ) -> bytes: ...
+
+
+class LibraryConnector(Protocol):
+    async def scan(self) -> list[LibraryMediaItem]: ...
+
+
+class SABWebhook(Protocol):
+    async def handle(self, event: SABCompletionEvent) -> SABWebhookResult: ...
+
+
+class HealthConnector(Protocol):
+    async def healthcheck(self) -> ConnectorHealth: ...
+
+
+class ActionQueue(Protocol):
+    async def enqueue(self, *, action: str, payload: dict[str, str]) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowOutcome:
+    job_id: str
+    status: WorkflowStatus
+    result: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedAction:
+    job_id: str
+    status: str = "accepted"
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardConnector:
+    id: str
+    name: str
+    status: ConnectorStatus
+    message: str
+    latency_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardCounters:
+    fetched: int = 0
+    matches: int = 0
+    misses: int = 0
+    repaired: int = 0
+    uploaded: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardActivity:
+    id: str
+    type: str
+    title: str
+    message: str
+    status: str
+    created_at: str
+    miss_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardStuckTorrent:
+    hash: str
+    name: str
+    category: str
+    progress: float
+    missing_nfo_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardSnapshot:
+    connectors: tuple[DashboardConnector, ...]
+    counters: DashboardCounters
+    recent_activity: tuple[DashboardActivity, ...]
+    stuck_torrents: tuple[DashboardStuckTorrent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _StuckRecord:
+    torrent: TorrentSnapshot
+    candidate: MissingNFO
+
+
+@dataclass(slots=True)
+class _RepairSummary:
+    successes: int = 0
+    failures: int = 0
+    dry_runs: int = 0
+
+    @property
+    def status(self) -> WorkflowStatus:
+        if self.failures and self.successes:
+            return "partial"
+        if self.failures:
+            return "failed"
+        if self.dry_runs and not self.successes:
+            return "dry_run"
+        if self.successes:
+            return "success"
+        return "skipped"
+
+
+class OperationsRuntimeStore:
+    """Adapt ``OperationsStore`` to the runtime's persistence boundary."""
+
+    records_miss_activity = True
+
+    def __init__(self, operations: OperationsStore) -> None:
+        self._operations = operations
+
+    async def start_job(self, *, action: str, target: str | None = None) -> str:
+        job_id = f"{action.replace('_', '-')}-{uuid4().hex}"
+        await self._operations.create_job(
+            job_id=job_id,
+            kind=action,
+            status="running",
+        )
+        if target is not None:
+            await self._operations.record_activity(
+                event_type="job_started",
+                message=f"{action.replace('_', ' ')} started",
+                details={"job_id": job_id, "target": target, "status": "info"},
+            )
+        return job_id
+
+    async def finish_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        detail: str | None = None,
+    ) -> object:
+        result = {"detail": detail} if detail is not None else {}
+        return await self._operations.update_job(job_id, status=status, result=result)
+
+    async def increment_counter(self, name: str, amount: int = 1) -> object:
+        return await self._operations.increment_counter(name, amount)
+
+    async def record_activity(
+        self,
+        *,
+        activity_type: str,
+        status: str,
+        title: str,
+        message: str,
+        miss_id: str | None = None,
+    ) -> object:
+        details: dict[str, object] = {"status": status, "title": title}
+        if miss_id is not None:
+            details["miss_id"] = miss_id
+        return await self._operations.record_activity(
+            event_type=activity_type,
+            message=message,
+            details=details,
+        )
+
+    async def record_miss(
+        self,
+        *,
+        source: str,
+        release_name: str,
+        reason: str,
+        retryable: bool,
+    ) -> str:
+        miss_id = f"miss-{uuid4().hex}"
+        await self._operations.record_activity(
+            event_type="miss",
+            message=reason,
+            details={
+                "miss_id": miss_id,
+                "source": source,
+                "release_name": release_name,
+                "retryable": retryable,
+                "status": "warning",
+                "title": "CrowdNFO miss",
+            },
+        )
+        return miss_id
+
+    async def get_counters(self) -> Mapping[str, int]:
+        return await self._operations.get_counters()
+
+    async def recent_activity(self, *, limit: int) -> Sequence[Mapping[str, object]]:
+        records = await self._operations.list_activity(limit=limit)
+        return [
+            {
+                "id": str(record.id),
+                "type": record.event_type,
+                "title": str(
+                    record.details.get(
+                        "title", record.event_type.replace("_", " ").title()
+                    )
+                ),
+                "message": record.message,
+                "status": str(record.details.get("status", "info")),
+                "created_at": record.created_at.isoformat(),
+                **(
+                    {"miss_id": str(record.details["miss_id"])}
+                    if record.details.get("miss_id") is not None
+                    else {}
+                ),
+            }
+            for record in records
+        ]
+
+
+class InProcessActionQueue:
+    """Execute accepted actions in bounded, lifecycle-owned asyncio tasks."""
+
+    def __init__(self, *, store: RuntimeStore, max_concurrency: int = 2) -> None:
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be at least one")
+        self._store = store
+        self._runtime: CrowdarrrRuntime | None = None
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
+
+    def bind(self, runtime: CrowdarrrRuntime) -> None:
+        if self._runtime is not None and self._runtime is not runtime:
+            raise RuntimeError("action queue is already bound")
+        self._runtime = runtime
+
+    async def enqueue(self, *, action: str, payload: dict[str, str]) -> str:
+        if self._closed:
+            raise RuntimeError("action queue is closed")
+        runtime = self._runtime
+        if runtime is None:
+            raise RuntimeError("action queue is not bound")
+        target = payload.get("torrent_hash") or payload.get("miss_id")
+        job_id = await self._store.start_job(action=action, target=target)
+
+        async def execute() -> None:
+            async with self._semaphore:
+                try:
+                    await runtime.run_queued_action(
+                        action=action,
+                        payload=payload,
+                        job_id=job_id,
+                    )
+                except asyncio.CancelledError:
+                    await self._store.finish_job(
+                        job_id,
+                        status="failed",
+                        detail="application shutdown",
+                    )
+                    raise
+                except Exception as error:
+                    safe_error = sanitized_error(error)
+                    LOGGER.exception("queued runtime action failed (%s)", safe_error)
+                    await self._store.finish_job(
+                        job_id,
+                        status="failed",
+                        detail=safe_error,
+                    )
+
+        task = asyncio.create_task(execute(), name=f"crowdarrr-{action}-{job_id}")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return job_id
+
+    async def close(self) -> None:
+        self._closed = True
+        tasks = tuple(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class CrowdarrrRuntime:
+    """Compose connector operations into durable, user-facing workflows."""
+
+    def __init__(
+        self,
+        *,
+        settings: AppSettings,
+        store: RuntimeStore,
+        qbit: QBitRuntimeConnector | None = None,
+        repair_service: RepairService | None = None,
+        crowdnfo: CrowdNFODownloader | None = None,
+        library_connectors: Mapping[str, LibraryConnector] | None = None,
+        sab_webhook: SABWebhook | None = None,
+        health_connectors: Mapping[str, HealthConnector] | None = None,
+        action_queue: ActionQueue | None = None,
+    ) -> None:
+        self.settings = settings
+        self._store = store
+        self._qbit = qbit
+        self._repair = repair_service
+        self._crowdnfo = crowdnfo
+        self._library_connectors = dict(library_connectors or {})
+        self._sab_webhook = sab_webhook
+        self._health_connectors = dict(health_connectors or {})
+        self._action_queue = action_queue
+
+    async def _start_job(
+        self,
+        *,
+        action: str,
+        target: str | None = None,
+        job_id: str | None = None,
+    ) -> str:
+        if job_id is not None:
+            return job_id
+        return await self._store.start_job(action=action, target=target)
+
+    async def _finish(
+        self,
+        job_id: str,
+        status: WorkflowStatus,
+        *,
+        result: object | None = None,
+        detail: str | None = None,
+    ) -> WorkflowOutcome:
+        await self._store.finish_job(job_id, status=status, detail=detail)
+        return WorkflowOutcome(job_id=job_id, status=status, result=result)
+
+    async def _discover_stuck_records(self) -> list[_StuckRecord]:
+        if self._qbit is None:
+            return []
+        records: list[_StuckRecord] = []
+        torrents = await self._qbit.list_torrents()
+        for torrent in torrents:
+            if torrent.progress >= 1:
+                continue
+            files = await self._qbit.list_files(torrent.torrent_hash)
+            hydrated = replace(torrent, files=files)
+            records.extend(
+                _StuckRecord(torrent=hydrated, candidate=candidate)
+                for candidate in find_stuck_nfos(hydrated)
+            )
+        return records
+
+    async def discover_stuck_torrents(self) -> list[MissingNFO]:
+        return [record.candidate for record in await self._discover_stuck_records()]
+
+    @staticmethod
+    def _miss_reason(error: BaseException) -> str:
+        if isinstance(error, LookupError):
+            return "not found"
+        if (
+            isinstance(error, httpx.HTTPStatusError)
+            and error.response.status_code == 404
+        ):
+            return "not found"
+        return sanitized_error(error)
+
+    async def _record_miss(
+        self,
+        *,
+        source: str,
+        release_name: str,
+        reason: str,
+        retryable: bool,
+    ) -> None:
+        await self._store.increment_counter("misses")
+        miss_id = await self._store.record_miss(
+            source=source,
+            release_name=release_name,
+            reason=reason,
+            retryable=retryable,
+        )
+        if not bool(getattr(self._store, "records_miss_activity", False)):
+            await self._store.record_activity(
+                activity_type="miss",
+                status="warning",
+                title="CrowdNFO miss",
+                message=reason,
+                miss_id=miss_id,
+            )
+
+    async def _process_repair_candidates(
+        self, candidates: Sequence[MissingNFO]
+    ) -> _RepairSummary:
+        summary = _RepairSummary()
+        if self._repair is None:
+            summary.failures = len(candidates)
+            return summary
+
+        for candidate in candidates:
+            try:
+                result = await self._repair.repair(candidate)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                reason = self._miss_reason(error)
+                await self._record_miss(
+                    source="qbittorrent",
+                    release_name=candidate.torrent_name,
+                    reason=reason,
+                    retryable=True,
+                )
+                summary.failures += 1
+                continue
+
+            if result.status is RepairStatus.SUCCESS:
+                for counter in ("fetched", "matches", "repaired"):
+                    await self._store.increment_counter(counter)
+                await self._store.record_activity(
+                    activity_type="repair",
+                    status="success",
+                    title="Torrent repaired",
+                    message=candidate.torrent_name,
+                )
+                summary.successes += 1
+            elif result.status is RepairStatus.DRY_RUN:
+                await self._store.record_activity(
+                    activity_type="repair",
+                    status="info",
+                    title="Dry-run repair",
+                    message=candidate.torrent_name,
+                )
+                summary.dry_runs += 1
+            else:
+                await self._record_miss(
+                    source="qbittorrent",
+                    release_name=candidate.torrent_name,
+                    reason=(
+                        "nfo mismatch"
+                        if result.status is RepairStatus.MISMATCH
+                        else "verification timed out"
+                    ),
+                    retryable=result.retryable,
+                )
+                summary.failures += 1
+        return summary
+
+    def _qbit_scan_enabled(self) -> bool:
+        return self.settings.qbittorrent.enabled and mode_allows_trigger(
+            self.settings.download_mode,
+            ScanTrigger.BACKFILL,
+        )
+
+    async def scan_and_repair(self, *, job_id: str | None = None) -> WorkflowOutcome:
+        job_id = await self._start_job(action="scan_and_repair", job_id=job_id)
+        if not self._qbit_scan_enabled() or self._qbit is None:
+            return await self._finish(job_id, "skipped", detail="scan disabled")
+        try:
+            candidates = await self.discover_stuck_torrents()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            detail = sanitized_error(error)
+            LOGGER.info("qbittorrent unavailable during scan (%s)", detail)
+            await self._store.record_activity(
+                activity_type="connector",
+                status="warning",
+                title="qBittorrent unavailable",
+                message=detail,
+            )
+            return await self._finish(job_id, "skipped", detail=detail)
+        if not candidates:
+            return await self._finish(job_id, "success")
+        if self._repair is None:
+            return await self._finish(
+                job_id,
+                "skipped",
+                detail="repair service unavailable",
+            )
+        summary = await self._process_repair_candidates(candidates)
+        return await self._finish(job_id, summary.status)
+
+    async def repair_torrent(
+        self,
+        torrent_hash: str,
+        *,
+        job_id: str | None = None,
+    ) -> WorkflowOutcome:
+        if not torrent_hash:
+            raise ValueError("torrent hash cannot be blank")
+        job_id = await self._start_job(
+            action="repair_torrent",
+            target=torrent_hash,
+            job_id=job_id,
+        )
+        if not self.settings.qbittorrent.enabled or self._qbit is None:
+            return await self._finish(job_id, "skipped", detail="connector disabled")
+        if self._repair is None:
+            return await self._finish(
+                job_id,
+                "skipped",
+                detail="repair service unavailable",
+            )
+        try:
+            torrent = await self._qbit.get_torrent(torrent_hash)
+            candidates = find_stuck_nfos(torrent)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            detail = sanitized_error(error)
+            LOGGER.info("qbittorrent unavailable during targeted repair (%s)", detail)
+            return await self._finish(job_id, "skipped", detail=detail)
+        if not candidates:
+            return await self._finish(job_id, "skipped", detail="no missing nfo")
+        summary = await self._process_repair_candidates(candidates)
+        return await self._finish(job_id, summary.status)
+
+    def _library_scan_enabled(self) -> bool:
+        return mode_allows_trigger(
+            self.settings.download_mode,
+            ScanTrigger.BACKFILL,
+        )
+
+    def _library_connector_enabled(self, name: str) -> bool:
+        connector_settings = getattr(self.settings, name, None)
+        return bool(getattr(connector_settings, "enabled", False))
+
+    @property
+    def _allowed_roots(self) -> tuple[Path, ...]:
+        return tuple(
+            Path(mapping.local_root) for mapping in self.settings.path_mappings
+        )
+
+    async def scan_libraries(self, *, job_id: str | None = None) -> WorkflowOutcome:
+        job_id = await self._start_job(action="scan_libraries", job_id=job_id)
+        if not self._library_scan_enabled():
+            return await self._finish(job_id, "skipped", detail="backfill disabled")
+        enabled = {
+            name: connector
+            for name, connector in self._library_connectors.items()
+            if self._library_connector_enabled(name)
+        }
+        if not enabled or self._crowdnfo is None:
+            return await self._finish(
+                job_id,
+                "skipped",
+                detail="library connectors unavailable",
+            )
+        outcomes = await ConnectorSupervisor().run_all(
+            operation="scan",
+            connectors=cast(Mapping[str, object], enabled),
+        )
+        connector_failures = sum(outcome.skipped for outcome in outcomes.values())
+        items: list[LibraryMediaItem] = []
+        for outcome in outcomes.values():
+            if not isinstance(outcome.value, list):
+                continue
+            items.extend(
+                item for item in outcome.value if isinstance(item, LibraryMediaItem)
+            )
+        missing_items = find_missing_sidecars(items)
+        successes = 0
+        failures = connector_failures
+        dry_runs = 0
+        roots = self._allowed_roots
+        for item in missing_items:
+            if self.settings.dry_run:
+                dry_runs += 1
+                await self._store.record_activity(
+                    activity_type="library_fetch",
+                    status="info",
+                    title="Dry-run library fetch",
+                    message=item.release_name,
+                )
+                continue
+            try:
+                payload = await self._crowdnfo.download_nfo(
+                    release_name=item.release_name,
+                    media_sha256=None,
+                )
+                if not payload:
+                    raise ValueError("downloaded nfo is empty")
+                if not roots:
+                    raise ValueError("no allowed media roots are configured")
+                await asyncio.to_thread(
+                    atomic_write_bytes,
+                    item.sidecar_path,
+                    payload,
+                    allowed_roots=roots,
+                    overwrite=False,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await self._record_miss(
+                    source=item.source,
+                    release_name=item.release_name,
+                    reason=self._miss_reason(error),
+                    retryable=True,
+                )
+                failures += 1
+                continue
+            for counter in ("fetched", "matches"):
+                await self._store.increment_counter(counter)
+            await self._store.record_activity(
+                activity_type="library_fetch",
+                status="success",
+                title="Library NFO fetched",
+                message=item.release_name,
+            )
+            successes += 1
+
+        if failures and successes:
+            status: WorkflowStatus = "partial"
+        elif failures:
+            status = "failed"
+        elif dry_runs:
+            status = "dry_run"
+        else:
+            status = "success"
+        return await self._finish(job_id, status)
+
+    async def handle_sab_completion(
+        self,
+        event: SABCompletionEvent,
+        *,
+        job_id: str | None = None,
+    ) -> WorkflowOutcome:
+        job_id = await self._start_job(
+            action="sab_completion",
+            target=event.nzo_id or event.release_name,
+            job_id=job_id,
+        )
+        live_in_enabled = mode_allows_trigger(
+            self.settings.download_mode,
+            ScanTrigger.NEW_DOWNLOAD,
+        )
+        if (
+            not self.settings.sabnzbd.enabled
+            or self._sab_webhook is None
+            or (not live_in_enabled and not self.settings.contribute.enabled)
+        ):
+            return await self._finish(job_id, "skipped", detail="SAB workflow disabled")
+        try:
+            result = await self._sab_webhook.handle(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            detail = sanitized_error(error)
+            LOGGER.info("sabnzbd unavailable during completion handling (%s)", detail)
+            return await self._finish(job_id, "skipped", detail=detail)
+
+        successes = 0
+        failures = 0
+        for action in result.actions:
+            action_error = result.errors.get(action)
+            if action_error is not None:
+                failures += 1
+                await self._store.record_activity(
+                    activity_type=f"sab_{action}",
+                    status="warning",
+                    title=f"SAB {action} failed",
+                    message=action_error,
+                )
+                continue
+            successes += 1
+            if action == "fetch":
+                for counter in ("fetched", "matches"):
+                    await self._store.increment_counter(counter)
+            elif action == "contribute":
+                await self._store.increment_counter("uploaded")
+            await self._store.record_activity(
+                activity_type=f"sab_{action}",
+                status="success",
+                title=f"SAB {action} complete",
+                message=event.release_name,
+            )
+
+        if failures and successes:
+            status: WorkflowStatus = "partial"
+        elif failures:
+            status = "failed"
+        elif successes:
+            status = "success"
+        else:
+            status = "skipped"
+        return await self._finish(job_id, status, result=result)
+
+    def _connector_enabled(self, name: str) -> bool:
+        if name == "crowdnfo":
+            return name in self._health_connectors
+        settings = getattr(self.settings, name, None)
+        return bool(getattr(settings, "enabled", False))
+
+    async def _health_snapshot(self) -> tuple[DashboardConnector, ...]:
+        snapshots: list[DashboardConnector] = []
+        for connector_id, name in _CONNECTOR_LABELS.items():
+            connector = self._health_connectors.get(connector_id)
+            enabled = self._connector_enabled(connector_id)
+            if connector is None:
+                snapshots.append(
+                    DashboardConnector(
+                        id=connector_id,
+                        name=name,
+                        status="unhealthy" if enabled else "disabled",
+                        message=(
+                            "configuration incomplete" if enabled else "not configured"
+                        ),
+                    )
+                )
+                continue
+            if not enabled:
+                snapshots.append(
+                    DashboardConnector(
+                        id=connector_id,
+                        name=name,
+                        status="disabled",
+                        message="not configured",
+                    )
+                )
+                continue
+            started = time.perf_counter()
+            try:
+                health = await connector.healthcheck()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                detail = sanitized_error(error)
+                LOGGER.info("%s unavailable during healthcheck (%s)", name, detail)
+                health = ConnectorHealth(False, detail=detail)
+            latency = max(0, round((time.perf_counter() - started) * 1_000))
+            status: ConnectorStatus = "healthy" if health.healthy else "unhealthy"
+            snapshots.append(
+                DashboardConnector(
+                    id=connector_id,
+                    name=name,
+                    status=status,
+                    message=health.detail or health.version or status,
+                    latency_ms=latency,
+                )
+            )
+        return tuple(snapshots)
+
+    @staticmethod
+    def _activity_from_mapping(item: Mapping[str, object]) -> DashboardActivity:
+        miss_id = item.get("miss_id")
+        return DashboardActivity(
+            id=str(item.get("id", "")),
+            type=str(item.get("type", "activity")),
+            title=str(item.get("title", "Activity")),
+            message=str(item.get("message", "")),
+            status=str(item.get("status", "info")),
+            created_at=str(item.get("created_at", "")),
+            miss_id=str(miss_id) if miss_id is not None else None,
+        )
+
+    async def dashboard_snapshot(self) -> DashboardSnapshot:
+        health_task = asyncio.create_task(self._health_snapshot())
+        counters_task = asyncio.create_task(self._store.get_counters())
+        activity_task = asyncio.create_task(self._store.recent_activity(limit=50))
+        try:
+            stuck_records = (
+                await self._discover_stuck_records()
+                if self.settings.qbittorrent.enabled and self._qbit is not None
+                else []
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            detail = sanitized_error(error)
+            LOGGER.info("qbittorrent unavailable during dashboard scan (%s)", detail)
+            stuck_records = []
+        connectors, raw_counters, raw_activity = await asyncio.gather(
+            health_task,
+            counters_task,
+            activity_task,
+        )
+        counters = {name: int(raw_counters.get(name, 0)) for name in _COUNTER_NAMES}
+        return DashboardSnapshot(
+            connectors=connectors,
+            counters=DashboardCounters(**counters),
+            recent_activity=tuple(
+                self._activity_from_mapping(item) for item in raw_activity
+            ),
+            stuck_torrents=tuple(
+                DashboardStuckTorrent(
+                    hash=record.torrent.torrent_hash,
+                    name=record.torrent.name,
+                    category=record.torrent.category,
+                    progress=record.torrent.progress,
+                    missing_nfo_path=str(record.candidate.reported_path),
+                )
+                for record in stuck_records
+            ),
+        )
+
+    async def snapshot(self) -> DashboardSnapshot:
+        """Dashboard-service alias used by the FastAPI service container."""
+
+        return await self.dashboard_snapshot()
+
+    async def enqueue_scan_and_repair(self) -> QueuedAction:
+        if self._action_queue is None:
+            raise RuntimeError("action queue is unavailable")
+        return QueuedAction(
+            await self._action_queue.enqueue(action="scan_and_repair", payload={})
+        )
+
+    async def enqueue_repair_torrent(self, torrent_hash: str) -> QueuedAction:
+        if not torrent_hash:
+            raise ValueError("torrent hash cannot be blank")
+        if self._action_queue is None:
+            raise RuntimeError("action queue is unavailable")
+        return QueuedAction(
+            await self._action_queue.enqueue(
+                action="repair_torrent",
+                payload={"torrent_hash": torrent_hash},
+            )
+        )
+
+    async def enqueue_retry_miss(self, miss_id: str) -> QueuedAction:
+        if not miss_id:
+            raise ValueError("miss id cannot be blank")
+        if self._action_queue is None:
+            raise RuntimeError("action queue is unavailable")
+        return QueuedAction(
+            await self._action_queue.enqueue(
+                action="retry_miss",
+                payload={"miss_id": miss_id},
+            )
+        )
+
+    async def full_backfill(self, *, job_id: str | None = None) -> WorkflowOutcome:
+        """Run qBittorrent repair and library enrichment as one parent action."""
+
+        job_id = await self._start_job(action="full_backfill", job_id=job_id)
+        qbit_outcome = await self.scan_and_repair()
+        library_outcome = await self.scan_libraries()
+        statuses = {qbit_outcome.status, library_outcome.status}
+        if "partial" in statuses or (
+            "failed" in statuses and bool(statuses & {"success", "dry_run"})
+        ):
+            status: WorkflowStatus = "partial"
+        elif "failed" in statuses:
+            status = "failed"
+        elif "success" in statuses:
+            status = "success"
+        elif "dry_run" in statuses:
+            status = "dry_run"
+        else:
+            status = "skipped"
+        return await self._finish(
+            job_id,
+            status,
+            result={
+                "qbittorrent_job_id": qbit_outcome.job_id,
+                "library_job_id": library_outcome.job_id,
+            },
+        )
+
+    async def run_queued_action(
+        self,
+        *,
+        action: str,
+        payload: Mapping[str, str],
+        job_id: str,
+    ) -> WorkflowOutcome:
+        if action == "scan_and_repair":
+            return await self.full_backfill(job_id=job_id)
+        if action == "repair_torrent":
+            torrent_hash = payload.get("torrent_hash")
+            if not torrent_hash:
+                return await self._finish(
+                    job_id, "failed", detail="invalid job payload"
+                )
+            return await self.repair_torrent(torrent_hash, job_id=job_id)
+        if action == "retry_miss":
+            return await self.scan_and_repair(job_id=job_id)
+        return await self._finish(job_id, "failed", detail="unknown action")
