@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
 
 import {
   CloseIcon,
@@ -14,6 +14,10 @@ const navigation = [
   { end: false, icon: SettingsIcon, label: "Settings", to: "/settings" },
   { end: false, icon: LogsIcon, label: "Live logs", to: "/logs" },
 ];
+
+function pageTitle(pathname: string): string {
+  return navigation.find(({ to }) => to === pathname)?.label ?? "Dashboard";
+}
 
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(
@@ -73,8 +77,23 @@ function Brand() {
 
 export default function AppShell({ children }: { children: ReactNode }) {
   const compact = useMediaQuery("(max-width: 767px)");
+  const { pathname } = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [routeAnnouncement, setRouteAnnouncement] = useState<string>();
+  const initialPathnameRef = useRef(pathname);
+  const mainRef = useRef<HTMLElement>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const currentPage = pageTitle(pathname);
+
+  useEffect(() => {
+    document.title = `${currentPage} · Crowdarrr`;
+    mainRef.current?.querySelector<HTMLHeadingElement>("h1")?.focus();
+
+    if (initialPathnameRef.current !== pathname) {
+      setRouteAnnouncement(currentPage);
+      initialPathnameRef.current = pathname;
+    }
+  }, [currentPage, pathname]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -137,9 +156,22 @@ export default function AppShell({ children }: { children: ReactNode }) {
         </div>
       ) : null}
 
+      {routeAnnouncement ? (
+        <p
+          aria-atomic="true"
+          aria-label="Current page"
+          aria-live="polite"
+          className="sr-only"
+          role="status"
+        >
+          {routeAnnouncement}
+        </p>
+      ) : null}
+
       <main
         className={compact ? "min-h-screen" : "min-h-screen pl-64"}
         id="main-content"
+        ref={mainRef}
       >
         <div className="mx-auto max-w-[1500px] px-4 py-7 sm:px-6 sm:py-9 lg:px-10">
           {children}

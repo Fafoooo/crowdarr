@@ -73,7 +73,7 @@ export interface PathMapping {
 
 export interface CategoryMapping {
   category: string;
-  save_path: string;
+  crowdnfo_category: string;
 }
 
 export interface SettingsData {

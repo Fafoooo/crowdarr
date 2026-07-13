@@ -26,7 +26,6 @@ import type {
   SettingsData,
 } from "../types";
 
-type SettingsDialect = "ui" | "canonical";
 type ConfigurableConnectorId = Exclude<ConnectorId, "crowdnfo">;
 type SecretKey =
   | "crowdnfo_api_key"
@@ -44,6 +43,22 @@ const emptySecrets: SecretDrafts = {
   sabnzbd_api_key: "",
   sonarr_api_key: "",
 };
+
+const crowdNfoCategories = [
+  "Movies",
+  "TV",
+  "Games",
+  "Software",
+  "Music",
+  "Books",
+  "Audiobooks",
+  "Other",
+  "Unknown",
+] as const;
+
+function isCrowdNfoCategory(value: string): boolean {
+  return (crowdNfoCategories as readonly string[]).includes(value);
+}
 
 const connectorDefinitions: Array<{
   id: ConfigurableConnectorId;
@@ -152,108 +167,74 @@ function normaliseCategoryMappings(value: unknown): CategoryMapping[] {
       const mapping = record(entry);
       return {
         category: stringValue(mapping.category),
-        save_path: stringValue(mapping.save_path),
+        crowdnfo_category: stringValue(
+          mapping.crowdnfo_category,
+          stringValue(mapping.save_path),
+        ),
       };
     });
   }
   if (isRecord(value)) {
-    return Object.entries(value).map(([category, savePath]) => ({
+    return Object.entries(value).map(([category, crowdnfoCategory]) => ({
       category,
-      save_path: stringValue(savePath),
+      crowdnfo_category: stringValue(crowdnfoCategory),
     }));
   }
   return [];
 }
 
-function normaliseSettings(raw: unknown): {
-  dialect: SettingsDialect;
-  settings: SettingsData;
-} {
+function normaliseSettings(raw: unknown): SettingsData {
   const value = record(raw);
-  const nestedConnectors = isRecord(value.connectors);
-  const connectors = nestedConnectors ? record(value.connectors) : value;
   const configuredSecrets = record(value.secrets_configured);
   const crowdnfo = record(value.crowdnfo);
-  const contribution = record(value.contribution ?? value.contribute);
-  const matching = record(value.matching);
+  const contribution = record(value.contribute);
   const hashBytes = numberValue(value.hash_max_size_bytes, 80 * 1024 ** 3);
 
   return {
-    dialect: nestedConnectors ? "ui" : "canonical",
-    settings: {
-      backfill_cron: stringValue(value.backfill_cron, "0 3 * * *"),
-      category_mappings: normaliseCategoryMappings(value.category_mappings),
-      connectors: {
-        qbittorrent: sanitiseConnector(
-          connectors.qbittorrent,
-          configuredSecrets,
-          "qbittorrent",
-        ),
-        radarr: sanitiseConnector(
-          connectors.radarr,
-          configuredSecrets,
-          "radarr",
-        ),
-        sabnzbd: sanitiseConnector(
-          connectors.sabnzbd,
-          configuredSecrets,
-          "sabnzbd",
-        ),
-        sonarr: sanitiseConnector(
-          connectors.sonarr,
-          configuredSecrets,
-          "sonarr",
-        ),
-        umlautadaptarr: sanitiseConnector(
-          connectors.umlautadaptarr,
-          configuredSecrets,
-          "umlautadaptarr",
-        ),
-      },
-      contribution: {
-        enabled: booleanValue(contribution.enabled),
-        filelist: booleanValue(contribution.filelist),
-        mediainfo: booleanValue(contribution.mediainfo),
-        nfo: booleanValue(contribution.nfo),
-      },
-      crowdnfo: {
-        api_key_configured: booleanValue(
-          crowdnfo.api_key_configured,
-          booleanValue(configuredSecrets.crowdnfo_api_key),
-        ),
-        base_url: stringValue(crowdnfo.base_url, "https://crowdnfo.net"),
-      },
-      download_mode:
-        value.download_mode === "new_only" ||
-        value.download_mode === "new_and_backfill"
-          ? value.download_mode
-          : "off",
-      dry_run: booleanValue(value.dry_run, true),
-      matching: {
-        max_hash_size_gib: numberValue(
-          matching.max_hash_size_gib,
-          Math.round(hashBytes / 1024 ** 3),
-        ),
-        strategy:
-          matching.strategy === "hash_only" ||
-          matching.strategy === "release_name_only"
-            ? matching.strategy
-            : value.match_strategy === "hash_only" ||
-                value.match_strategy === "release_name_only"
-              ? value.match_strategy
-              : "hash_then_release_name",
-      },
-      mismatch_policy:
-        value.mismatch_policy === "remove" ||
-        value.nfo_mismatch_policy === "remove"
-          ? "remove"
-          : "keep",
-      path_mappings: normalisePathMappings(value.path_mappings),
-      recheck_after_repair: booleanValue(
-        value.recheck_after_repair,
-        booleanValue(value.auto_recheck, true),
+    backfill_cron: stringValue(value.backfill_cron, "0 3 * * *"),
+    category_mappings: normaliseCategoryMappings(value.category_mappings),
+    connectors: {
+      qbittorrent: sanitiseConnector(
+        value.qbittorrent,
+        configuredSecrets,
+        "qbittorrent",
+      ),
+      radarr: sanitiseConnector(value.radarr, configuredSecrets, "radarr"),
+      sabnzbd: sanitiseConnector(value.sabnzbd, configuredSecrets, "sabnzbd"),
+      sonarr: sanitiseConnector(value.sonarr, configuredSecrets, "sonarr"),
+      umlautadaptarr: sanitiseConnector(
+        value.umlautadaptarr,
+        configuredSecrets,
+        "umlautadaptarr",
       ),
     },
+    contribution: {
+      enabled: booleanValue(contribution.enabled),
+      filelist: booleanValue(contribution.filelist),
+      mediainfo: booleanValue(contribution.mediainfo),
+      nfo: booleanValue(contribution.nfo),
+    },
+    crowdnfo: {
+      api_key_configured: booleanValue(configuredSecrets.crowdnfo_api_key),
+      base_url: stringValue(crowdnfo.base_url, "https://crowdnfo.net"),
+    },
+    download_mode:
+      value.download_mode === "new_only" ||
+      value.download_mode === "new_and_backfill"
+        ? value.download_mode
+        : "off",
+    dry_run: booleanValue(value.dry_run, true),
+    matching: {
+      max_hash_size_gib: Math.round(hashBytes / 1024 ** 3),
+      strategy:
+        value.match_strategy === "hash_only" ||
+        value.match_strategy === "release_name_only"
+          ? value.match_strategy
+          : "hash_then_release_name",
+    },
+    mismatch_policy: value.nfo_mismatch_policy === "remove" ? "remove" : "keep",
+    path_mappings: normalisePathMappings(value.path_mappings),
+    recheck_after_repair: booleanValue(value.auto_recheck, true),
   };
 }
 
@@ -433,70 +414,33 @@ function ConnectorFieldset({
 function buildPayload(
   settings: SettingsData,
   secrets: SecretDrafts,
-  dialect: SettingsDialect,
 ): Record<string, unknown> {
-  if (dialect === "ui") {
-    const payload: Record<string, unknown> = {
-      ...settings,
-      connectors: {
-        ...settings.connectors,
-        qbittorrent: {
-          ...settings.connectors.qbittorrent,
-          ...(secrets.qbittorrent_password
-            ? { password: secrets.qbittorrent_password }
-            : {}),
-        },
-        radarr: {
-          ...settings.connectors.radarr,
-          ...(secrets.radarr_api_key
-            ? { api_key: secrets.radarr_api_key }
-            : {}),
-        },
-        sabnzbd: {
-          ...settings.connectors.sabnzbd,
-          ...(secrets.sabnzbd_api_key
-            ? { api_key: secrets.sabnzbd_api_key }
-            : {}),
-        },
-        sonarr: {
-          ...settings.connectors.sonarr,
-          ...(secrets.sonarr_api_key
-            ? { api_key: secrets.sonarr_api_key }
-            : {}),
-        },
-      },
-      crowdnfo: {
-        ...settings.crowdnfo,
-        ...(secrets.crowdnfo_api_key
-          ? { api_key: secrets.crowdnfo_api_key }
-          : {}),
-      },
-    };
-    return payload;
-  }
-
   const connectorPayload = (
     connector: ConnectorSettings,
     secret?: { field: "api_key" | "password"; value: string },
-  ) => ({
-    enabled: connector.enabled,
-    base_url: connector.url,
-    ...(connector.username ? { username: connector.username } : {}),
-    ...(secret?.value ? { [secret.field]: secret.value } : {}),
-  });
+  ) => {
+    const baseUrl = connector.url.trim();
+    const username = connector.username?.trim();
+    return {
+      enabled: connector.enabled,
+      base_url: baseUrl || null,
+      ...(username ? { username } : {}),
+      ...(secret?.value ? { [secret.field]: secret.value } : {}),
+    };
+  };
 
   return {
     auto_recheck: settings.recheck_after_repair,
     backfill_cron: settings.backfill_cron,
     category_mappings: Object.fromEntries(
-      settings.category_mappings.map(({ category, save_path }) => [
+      settings.category_mappings.map(({ category, crowdnfo_category }) => [
         category,
-        save_path,
+        crowdnfo_category,
       ]),
     ),
     contribute: settings.contribution,
     crowdnfo: {
-      base_url: settings.crowdnfo.base_url,
+      base_url: settings.crowdnfo.base_url.trim(),
       ...(secrets.crowdnfo_api_key
         ? { api_key: secrets.crowdnfo_api_key }
         : {}),
@@ -536,7 +480,6 @@ function buildPayload(
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<SettingsData>();
-  const [dialect, setDialect] = useState<SettingsDialect>("ui");
   const [secrets, setSecrets] = useState<SecretDrafts>(emptySecrets);
   const [loadError, setLoadError] = useState<string>();
   const [actionError, setActionError] = useState<string>();
@@ -547,11 +490,9 @@ export default function SettingsPage() {
   const loadSettings = useCallback(async () => {
     setLoadError(undefined);
     try {
-      const result = normaliseSettings(
-        await apiRequest<unknown>("/api/settings"),
+      setSettings(
+        normaliseSettings(await apiRequest<unknown>("/api/settings")),
       );
-      setSettings(result.settings);
-      setDialect(result.dialect);
       setSecrets(emptySecrets);
     } catch (error) {
       setLoadError(errorMessage(error));
@@ -606,12 +547,10 @@ export default function SettingsPage() {
     setFeedback(undefined);
     try {
       const response = await apiRequest<unknown>("/api/settings", {
-        body: JSON.stringify(buildPayload(settings, secrets, dialect)),
+        body: JSON.stringify(buildPayload(settings, secrets)),
         method: "PUT",
       });
-      const result = normaliseSettings(response);
-      setSettings(result.settings);
-      setDialect(result.dialect);
+      setSettings(normaliseSettings(response));
       setSecrets(emptySecrets);
       setFeedback("Settings saved");
     } catch (error) {
@@ -680,8 +619,9 @@ export default function SettingsPage() {
               >
                 Connections
               </h2>
-              <p className="mt-1 text-sm text-zinc-500">
-                Services are optional and can be tested before saving.
+              <p className="mt-1 text-sm text-zinc-400">
+                Connection tests use the last saved settings. Save changes
+                before testing.
               </p>
             </div>
 
@@ -1039,8 +979,8 @@ export default function SettingsPage() {
                   <h2 className="font-semibold text-zinc-100">
                     Category mappings
                   </h2>
-                  <p className="mt-1 text-xs text-zinc-500">
-                    Associate download categories with their save paths.
+                  <p className="mt-1 text-xs text-zinc-400">
+                    Map download categories to CrowdNFO release categories.
                   </p>
                 </div>
                 <Button
@@ -1049,7 +989,7 @@ export default function SettingsPage() {
                       ...current,
                       category_mappings: [
                         ...current.category_mappings,
-                        { category: "", save_path: "" },
+                        { category: "", crowdnfo_category: "Unknown" },
                       ],
                     }))
                   }
@@ -1082,20 +1022,30 @@ export default function SettingsPage() {
                       />
                     </Field>
                     <Field
-                      id={`save-path-${index}`}
-                      label={`Save path ${index + 1}`}
+                      id={`crowdnfo-category-${index}`}
+                      label={`CrowdNFO category ${index + 1}`}
                     >
-                      <input
+                      <select
                         className={inputClassName}
-                        id={`save-path-${index}`}
+                        id={`crowdnfo-category-${index}`}
                         onChange={(event) =>
                           updateCategoryMapping(index, {
-                            save_path: event.target.value,
+                            crowdnfo_category: event.target.value,
                           })
                         }
-                        type="text"
-                        value={mapping.save_path}
-                      />
+                        value={mapping.crowdnfo_category}
+                      >
+                        {!isCrowdNfoCategory(mapping.crowdnfo_category) ? (
+                          <option disabled value={mapping.crowdnfo_category}>
+                            {mapping.crowdnfo_category || "Unmapped"} (existing)
+                          </option>
+                        ) : null}
+                        {crowdNfoCategories.map((category) => (
+                          <option key={category} value={category}>
+                            {category}
+                          </option>
+                        ))}
+                      </select>
                     </Field>
                     <Button
                       aria-label={`Remove category mapping ${index + 1}`}
