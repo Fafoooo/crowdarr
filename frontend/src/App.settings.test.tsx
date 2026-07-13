@@ -396,7 +396,7 @@ describe("settings", () => {
 
     await user.click(screen.getByRole("button", { name: "Add path mapping" }));
     await user.type(screen.getByLabelText("Connector path 2"), "/downloads");
-    await user.type(screen.getByLabelText("Crowdarrr path 2"), "/data");
+    await user.type(screen.getByLabelText("crowdarr path 2"), "/data");
     await user.click(
       screen.getByRole("button", { name: "Remove path mapping 1" }),
     );

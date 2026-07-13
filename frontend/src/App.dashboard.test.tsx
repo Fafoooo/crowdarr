@@ -216,7 +216,9 @@ describe("dashboard", () => {
       within(torrents).getByText(/1 repairable.*3 incomplete/i),
     ).toBeVisible();
     expect(within(torrents).getByText("NFO repair queue")).toBeVisible();
-    expect(within(torrents).getByText("Other incomplete downloads")).toBeVisible();
+    expect(
+      within(torrents).getByText("Other incomplete downloads"),
+    ).toBeVisible();
     expect(within(torrents).getByText("2 NFO files")).toBeVisible();
     expect(
       within(torrents).getByText(/video data is below 99%/i),
@@ -353,8 +355,7 @@ describe("dashboard", () => {
     const miss = {
       created_at: "2026-07-13T09:00:00Z",
       id: "activity-miss",
-      message:
-        "Sample.Release-GROUP: CrowdNFO lookup returned not found",
+      message: "Sample.Release-GROUP: CrowdNFO lookup returned not found",
       miss_id: "miss-new",
       status: "warning",
       title: "Sample.Release-GROUP",
@@ -369,13 +370,15 @@ describe("dashboard", () => {
             : {
                 ...dashboardResponse,
                 recent_activity: [miss, ...dashboardResponse.recent_activity],
-                stuck_torrents: dashboardResponse.stuck_torrents.map((torrent) => ({
-                  ...torrent,
-                  repair_message:
-                    "Sample.Release-GROUP is not currently available in CrowdNFO",
-                  repair_outcome: "not_available",
-                  retryable: false,
-                })),
+                stuck_torrents: dashboardResponse.stuck_torrents.map(
+                  (torrent) => ({
+                    ...torrent,
+                    repair_message:
+                      "Sample.Release-GROUP is not currently available in CrowdNFO",
+                    repair_outcome: "not_available",
+                    retryable: false,
+                  }),
+                ),
               },
         );
       },
@@ -407,14 +410,18 @@ describe("dashboard", () => {
       }),
     );
 
-    expect(await screen.findByRole("status")).toHaveTextContent(
+    const missStatus = await screen.findByRole("status");
+    expect(missStatus).toHaveTextContent(
       /not currently available in CrowdNFO/i,
     );
+    expect(missStatus).toHaveClass("text-amber-200");
     expect(await screen.findByText("Not in CrowdNFO")).toBeVisible();
     expect(
       screen.getByRole("button", { name: /not available.*Sample\.Release/i }),
     ).toBeDisabled();
-    expect(screen.getAllByText("Sample.Release-GROUP").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Sample.Release-GROUP").length).toBeGreaterThan(
+      0,
+    );
     expect(screen.getByText(/lookup returned not found/i)).toBeVisible();
     expect(dashboardRequests).toBe(2);
   });
@@ -429,13 +436,15 @@ describe("dashboard", () => {
             ? dashboardResponse
             : {
                 ...dashboardResponse,
-                stuck_torrents: dashboardResponse.stuck_torrents.map((torrent) => ({
-                  ...torrent,
-                  repair_message:
-                    "Sample.Release-GROUP: CrowdNFO connection failed; retry is safe",
-                  repair_outcome: "fetch_failed",
-                  retryable: true,
-                })),
+                stuck_torrents: dashboardResponse.stuck_torrents.map(
+                  (torrent) => ({
+                    ...torrent,
+                    repair_message:
+                      "Sample.Release-GROUP: CrowdNFO connection failed; retry is safe",
+                    repair_outcome: "fetch_failed",
+                    retryable: true,
+                  }),
+                ),
               },
         );
       },
@@ -468,7 +477,9 @@ describe("dashboard", () => {
 
     expect(await screen.findByText("Fetch failed – retry")).toBeVisible();
     expect(
-      screen.getByRole("button", { name: /retry repair Sample\.Release-GROUP/i }),
+      screen.getByRole("button", {
+        name: /retry repair Sample\.Release-GROUP/i,
+      }),
     ).toBeEnabled();
     expect(screen.getByRole("alert")).toHaveTextContent(/connection failed/i);
   });

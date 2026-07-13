@@ -20,7 +20,7 @@ export function PageHeader({
           </p>
         ) : null}
         <h1
-          className="rounded-sm text-3xl font-semibold tracking-tight text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-4 focus-visible:ring-offset-zinc-950 sm:text-4xl"
+          className="w-fit rounded-sm text-3xl font-semibold tracking-tight text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-4 focus-visible:ring-offset-zinc-950 sm:text-4xl"
           tabIndex={-1}
         >
           {title}

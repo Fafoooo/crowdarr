@@ -15,6 +15,7 @@ import type {
   ConnectorHealth,
   DashboardData,
   JobResponse,
+  StuckTorrent,
 } from "../types";
 
 function errorMessage(error: unknown): string {
@@ -23,6 +24,46 @@ function errorMessage(error: unknown): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const repairOutcomes: readonly StuckTorrent["repair_outcome"][] = [
+  "dry_run",
+  "fetch_failed",
+  "fixed",
+  "mismatch",
+  "not_applicable",
+  "not_available",
+  "placed",
+  "ready",
+  "verification_pending",
+  "verified_incomplete",
+];
+
+const torrentReasons: readonly StuckTorrent["reason"][] = [
+  "inspection_failed",
+  "invalid_nfo_path",
+  "no_incomplete_nfo",
+  "no_video",
+  "ready",
+  "video_incomplete",
+];
+
+function repairOutcome(value: unknown, repairable: boolean) {
+  return typeof value === "string" &&
+    repairOutcomes.includes(value as StuckTorrent["repair_outcome"])
+    ? (value as StuckTorrent["repair_outcome"])
+    : repairable
+      ? "ready"
+      : "not_applicable";
+}
+
+function torrentReason(value: unknown, repairable: boolean) {
+  return typeof value === "string" &&
+    torrentReasons.includes(value as StuckTorrent["reason"])
+    ? (value as StuckTorrent["reason"])
+    : repairable
+      ? "ready"
+      : "inspection_failed";
 }
 
 function normaliseDashboard(raw: unknown): DashboardData {
@@ -87,13 +128,15 @@ function normaliseDashboard(raw: unknown): DashboardData {
             missing_nfo_path: missingNfoPath,
             name: typeof item.name === "string" ? item.name : "Unknown torrent",
             progress: typeof item.progress === "number" ? item.progress : 0,
-            reason:
-              typeof item.reason === "string"
-                ? (item.reason as DashboardData["stuck_torrents"][number]["reason"])
-                : repairable
-                  ? "ready"
-                  : "inspection_failed",
+            reason: torrentReason(item.reason, repairable),
             repairable,
+            repair_message:
+              typeof item.repair_message === "string"
+                ? item.repair_message
+                : undefined,
+            repair_outcome: repairOutcome(item.repair_outcome, repairable),
+            retryable:
+              typeof item.retryable === "boolean" ? item.retryable : repairable,
             state: typeof item.state === "string" ? item.state : "unknown",
           },
         ];
@@ -106,6 +149,7 @@ function normaliseDashboard(raw: unknown): DashboardData {
       fetched: typeof counters.fetched === "number" ? counters.fetched : 0,
       matches: typeof counters.matches === "number" ? counters.matches : 0,
       misses: typeof counters.misses === "number" ? counters.misses : 0,
+      placed: typeof counters.placed === "number" ? counters.placed : 0,
       repaired: typeof counters.repaired === "number" ? counters.repaired : 0,
       uploaded: typeof counters.uploaded === "number" ? counters.uploaded : 0,
     },
@@ -126,6 +170,16 @@ const statusStyles: Record<string, string> = {
 };
 
 function ConnectorCard({ connector }: { connector: ConnectorHealth }) {
+  const label =
+    connector.status === "healthy"
+      ? "Healthy"
+      : connector.status === "degraded"
+        ? "Limited"
+        : connector.status === "unhealthy"
+          ? "Unavailable"
+          : connector.status === "disabled"
+            ? "Disabled"
+            : "Unknown";
   return (
     <article className="rounded-xl border border-white/[0.06] bg-zinc-950/45 p-4 transition hover:border-white/10 hover:bg-zinc-950/70">
       <div className="flex items-start justify-between gap-3">
@@ -133,15 +187,21 @@ function ConnectorCard({ connector }: { connector: ConnectorHealth }) {
           <h3 className="truncate text-sm font-semibold text-zinc-100">
             {connector.name}
           </h3>
-          <p className="mt-1 truncate text-xs text-zinc-500">
+          <p
+            className="mt-1 line-clamp-3 min-h-12 text-xs leading-4 text-zinc-500"
+            title={connector.message}
+          >
             {connector.message}
           </p>
         </div>
-        <span
-          aria-label={connector.status}
-          className={`mt-1 size-2.5 shrink-0 rounded-full ${statusStyles[connector.status] ?? statusStyles.unknown} ${connector.status === "healthy" ? "shadow-[0_0_9px_rgb(52_211_153/0.7)]" : ""}`}
-          role="img"
-        />
+        <span className="flex shrink-0 items-center gap-1.5 rounded-full border border-white/[0.07] bg-black/20 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-300">
+          <span
+            aria-label={connector.status}
+            className={`size-2 rounded-full ${statusStyles[connector.status] ?? statusStyles.unknown} ${connector.status === "healthy" ? "shadow-[0_0_9px_rgb(52_211_153/0.7)]" : ""}`}
+            role="img"
+          />
+          {label}
+        </span>
       </div>
       <p className="mt-4 text-[11px] font-medium uppercase tracking-wider text-zinc-600">
         {connector.latency_ms == null
@@ -152,13 +212,58 @@ function ConnectorCard({ connector }: { connector: ConnectorHealth }) {
   );
 }
 
-const metricLabels = [
-  ["NFOs fetched", "fetched", "Downloaded from CrowdNFO"],
-  ["Torrents repaired", "repaired", "Verified complete and seeding"],
-  ["Uploads completed", "uploaded", "Contributions accepted"],
-  ["CrowdNFO matches", "matches", "Lookups that returned an NFO"],
-  ["CrowdNFO misses", "misses", "Lookups without a usable NFO"],
+const repairFunnel = [
+  ["CrowdNFO matches", "matches", "Lookup returned an exact NFO"],
+  ["NFOs fetched", "fetched", "Raw bytes downloaded"],
+  ["NFOs placed", "placed", "Atomically written into the release"],
+  ["Verified repairs", "repaired", "Torrent reached 100% and is seeding"],
 ] as const;
+
+const outcomeLabels: Record<
+  DashboardData["stuck_torrents"][number]["repair_outcome"],
+  { label: string; style: string }
+> = {
+  dry_run: {
+    label: "Simulation ready",
+    style: "border-sky-400/20 bg-sky-400/10 text-sky-200",
+  },
+  fetch_failed: {
+    label: "Fetch failed – retry",
+    style: "border-red-400/20 bg-red-400/10 text-red-200",
+  },
+  fixed: {
+    label: "Fixed",
+    style: "border-emerald-400/20 bg-emerald-400/10 text-emerald-200",
+  },
+  mismatch: {
+    label: "NFO mismatch",
+    style: "border-red-400/20 bg-red-400/10 text-red-200",
+  },
+  not_applicable: {
+    label: "Not an NFO issue",
+    style: "border-zinc-500/20 bg-zinc-500/10 text-zinc-400",
+  },
+  not_available: {
+    label: "Not in CrowdNFO",
+    style: "border-amber-400/20 bg-amber-400/10 text-amber-200",
+  },
+  placed: {
+    label: "Placed · recheck off",
+    style: "border-sky-400/20 bg-sky-400/10 text-sky-200",
+  },
+  ready: {
+    label: "Ready · lookup on repair",
+    style: "border-sky-400/20 bg-sky-400/10 text-sky-200",
+  },
+  verification_pending: {
+    label: "Recheck still pending",
+    style: "border-amber-400/20 bg-amber-400/10 text-amber-200",
+  },
+  verified_incomplete: {
+    label: "NFO verified · other data missing",
+    style: "border-amber-400/20 bg-amber-400/10 text-amber-200",
+  },
+};
 
 const reasonLabels: Record<
   DashboardData["stuck_torrents"][number]["reason"],
@@ -173,7 +278,7 @@ const reasonLabels: Record<
 };
 
 const JOB_POLL_INTERVAL_MS = 1_000;
-const JOB_POLL_ATTEMPTS = 310;
+const JOB_POLL_ATTEMPTS = 3_700;
 
 function wait(delayMs: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, delayMs));
@@ -197,17 +302,125 @@ function activityAccent(item: ActivityItem): string {
   return "bg-sky-400";
 }
 
+function TorrentCard({
+  dryRun,
+  onRepair,
+  pending,
+  torrent,
+}: {
+  dryRun: boolean;
+  onRepair: () => void;
+  pending: boolean;
+  torrent: StuckTorrent;
+}) {
+  const outcome = outcomeLabels[torrent.repair_outcome];
+  const unavailable = torrent.repair_outcome === "not_available";
+  const retry = torrent.repair_outcome === "fetch_failed";
+
+  return (
+    <article
+      aria-label={torrent.name}
+      className="grid gap-4 border-t border-white/[0.05] px-4 py-4 transition first:border-t-0 hover:bg-white/[0.02] sm:px-5 lg:grid-cols-[minmax(0,1.55fr)_minmax(11rem,1fr)_minmax(0,1.2fr)_5rem_auto] lg:items-center"
+    >
+      <div className="min-w-0">
+        <p
+          className="truncate text-sm font-semibold text-zinc-100"
+          title={torrent.name}
+        >
+          {torrent.name}
+        </p>
+        <p className="mt-1 flex flex-wrap gap-2 text-[11px] text-zinc-600">
+          <span>{torrent.category || "uncategorized"}</span>
+          <span aria-hidden="true">·</span>
+          <span>{torrent.state}</span>
+        </p>
+      </div>
+
+      <div className="min-w-0">
+        <span
+          className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${outcome.style}`}
+        >
+          {outcome.label}
+        </span>
+        <p className="mt-1.5 text-xs leading-4 text-zinc-500">
+          {torrent.repair_message ??
+            reasonLabels[torrent.reason] ??
+            torrent.reason}
+        </p>
+      </div>
+
+      <div className="min-w-0 text-xs text-zinc-400">
+        {torrent.missing_nfo_count > 1 ? (
+          <p className="font-medium text-zinc-300">
+            {torrent.missing_nfo_count} NFO files
+          </p>
+        ) : null}
+        {torrent.missing_nfo_path ? (
+          <p className="truncate" title={torrent.missing_nfo_path}>
+            {torrent.missing_nfo_path}
+          </p>
+        ) : (
+          <span className="text-zinc-700">No incomplete NFO path</span>
+        )}
+      </div>
+
+      <div>
+        <p className="font-mono text-sm font-semibold text-amber-300">
+          {(torrent.progress * 100).toFixed(1)}%
+        </p>
+        <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-zinc-800">
+          <div
+            className="h-full rounded-full bg-amber-400"
+            style={{ width: `${Math.min(100, torrent.progress * 100)}%` }}
+          />
+        </div>
+      </div>
+
+      <div className="lg:text-right">
+        {unavailable ? (
+          <Button
+            aria-label={`Not available — ${torrent.name}`}
+            disabled
+            type="button"
+          >
+            Not available
+          </Button>
+        ) : torrent.repairable ? (
+          <Button
+            aria-label={`${dryRun ? "Simulate repair" : retry ? "Retry repair" : "Repair"} ${torrent.name}`}
+            disabled={pending}
+            onClick={onRepair}
+            type="button"
+          >
+            <RepairIcon className="size-4" />
+            {dryRun ? "Simulate" : retry ? "Retry" : "Repair"}
+          </Button>
+        ) : (
+          <span className="text-xs text-zinc-600">No repair action</span>
+        )}
+      </div>
+    </article>
+  );
+}
+
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardData>();
   const [loadError, setLoadError] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const [actionMessage, setActionMessage] = useState<string>();
+  const [actionTone, setActionTone] = useState<"info" | "success" | "warning">(
+    "info",
+  );
   const [pendingAction, setPendingAction] = useState<string>();
   const repairIsRunning =
     pendingAction?.startsWith("repair-") &&
     actionMessage === "Repair is running…";
   const repairableTorrents =
     data?.stuck_torrents.filter((torrent) => torrent.repairable).length ?? 0;
+  const nfoRepairTorrents =
+    data?.stuck_torrents.filter((torrent) => torrent.reason === "ready") ?? [];
+  const otherIncompleteTorrents =
+    data?.stuck_torrents.filter((torrent) => torrent.reason !== "ready") ?? [];
 
   const loadDashboard = useCallback(async () => {
     setLoadError(undefined);
@@ -226,37 +439,53 @@ export default function DashboardPage() {
     setPendingAction(key);
     setActionError(undefined);
     setActionMessage(undefined);
+    setActionTone("info");
     try {
       const response = await apiRequest<ActionResponse>(path, {
         method: "POST",
       });
       if (data?.dry_run) {
+        setActionTone("warning");
         setActionMessage(
           "Simulation queued — dry run will not write files and will not recheck qBittorrent.",
         );
       } else if (key.startsWith("repair-") && response.job_id) {
+        setActionTone("info");
         setActionMessage("Repair is running…");
         const job = await waitForJob(response.job_id);
         if (job === undefined) {
+          setActionTone("info");
           setActionMessage(
             "Repair is still running — check Recent activity for the result.",
           );
         } else {
           await loadDashboard();
-          if (job.status === "success") {
-            setActionMessage("Repair completed successfully.");
+          if (job.result.message && job.result.outcome === "not_available") {
+            setActionTone("warning");
+            setActionMessage(job.result.message);
+          } else if (job.status === "success") {
+            setActionTone("success");
+            setActionMessage(
+              job.result.message
+                ? `Repair completed successfully — ${job.result.message}`
+                : "Repair completed successfully.",
+            );
           } else if (job.status === "dry_run") {
+            setActionTone("warning");
             setActionMessage(
               "Repair finished as a dry-run simulation; no files were changed.",
             );
           } else {
             setActionMessage(undefined);
             setActionError(
-              `Repair ${job.status} — see Recent activity for the exact reason.`,
+              job.result.message ??
+                job.result.detail ??
+                `Repair ${job.status} — see Recent activity for the exact reason.`,
             );
           }
         }
       } else {
+        setActionTone("info");
         setActionMessage(response.message ?? "Action accepted");
       }
     } catch (error) {
@@ -290,9 +519,9 @@ export default function DashboardPage() {
       {actionMessage ? (
         <div
           className={`flex items-center gap-2 rounded-xl border px-4 py-3 text-sm ${
-            data?.dry_run
+            actionTone === "warning"
               ? "border-amber-400/20 bg-amber-400/[0.08] text-amber-200"
-              : repairIsRunning
+              : actionTone === "info" || repairIsRunning
                 ? "border-sky-400/20 bg-sky-400/[0.08] text-sky-200"
                 : "border-emerald-400/20 bg-emerald-400/[0.08] text-emerald-200"
           }`}
@@ -344,38 +573,59 @@ export default function DashboardPage() {
             </div>
           </section>
 
-          <section
-            aria-label="Lifetime counters"
-            className="grid grid-cols-2 overflow-hidden rounded-2xl border border-white/[0.07] bg-zinc-900/70 shadow-panel sm:grid-cols-3 xl:grid-cols-5"
-          >
-            {metricLabels.map(([label, key, description]) => (
-              <div
-                aria-label={label}
-                className="border-b border-r border-white/[0.06] px-5 py-5 last:border-r-0 sm:py-6"
-                key={key}
-                role="group"
-              >
-                <p className="text-2xl font-semibold tabular-nums text-white sm:text-3xl">
-                  {data.counters[key].toLocaleString()}
-                </p>
-                <p className="mt-1 text-xs font-medium text-zinc-500">
-                  {label}
-                </p>
-                <p className="mt-1 text-[10px] leading-4 text-zinc-700">
-                  {description}
+          <section aria-label="Repair funnel" className="space-y-3">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-zinc-200">
+                  Lifetime repair funnel
+                </h2>
+                <p className="mt-1 text-xs text-zinc-600">
+                  Each stage narrows from a CrowdNFO match to a verified seeding
+                  torrent.
                 </p>
               </div>
-            ))}
+              <div className="flex gap-2 text-xs">
+                <span className="rounded-full border border-amber-400/15 bg-amber-400/[0.07] px-2.5 py-1 text-amber-300">
+                  {data.counters.misses.toLocaleString()} not found
+                </span>
+                <span className="rounded-full border border-violet-400/15 bg-violet-400/[0.07] px-2.5 py-1 text-violet-300">
+                  {data.counters.uploaded.toLocaleString()} contributions
+                </span>
+              </div>
+            </div>
+            <div className="grid overflow-hidden rounded-2xl border border-white/[0.07] bg-zinc-900/70 shadow-panel sm:grid-cols-2 xl:grid-cols-4">
+              {repairFunnel.map(([label, key, description], index) => (
+                <div
+                  aria-label={label}
+                  className="relative border-b border-white/[0.06] px-5 py-5 sm:border-r sm:py-6 xl:border-b-0"
+                  key={key}
+                  role="group"
+                >
+                  <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-sky-500/80">
+                    Stage {index + 1}
+                  </p>
+                  <p className="mt-2 text-3xl font-semibold tabular-nums text-white">
+                    {data.counters[key].toLocaleString()}
+                  </p>
+                  <p className="mt-1 text-xs font-semibold text-zinc-300">
+                    {label}
+                  </p>
+                  <p className="mt-1 text-[10px] leading-4 text-zinc-600">
+                    {description}
+                  </p>
+                </div>
+              ))}
+            </div>
           </section>
 
           <div className="space-y-6">
             <Panel
-              description="Every incomplete qBittorrent download, with the exact reason it is or is not ready for NFO repair."
+              description="NFO-only repairs stay focused; unrelated incomplete downloads are separated below."
               title="Incomplete qBittorrent torrents"
             >
               <section
                 aria-label="Incomplete qBittorrent torrents"
-                className="overflow-x-auto"
+                className="overflow-hidden"
               >
                 <p className="border-b border-white/[0.05] px-5 py-3 text-xs text-zinc-500">
                   {repairableTorrents.toLocaleString()} repairable ·{" "}
@@ -383,103 +633,63 @@ export default function DashboardPage() {
                 </p>
                 {data.stuck_torrents.length === 0 ? (
                   <p className="px-5 py-10 text-center text-sm text-zinc-500">
-                    No incomplete qBittorrent downloads were found.
+                    Nothing needs attention. No incomplete qBittorrent downloads
+                    were found.
                   </p>
                 ) : (
-                  <table className="w-full min-w-[700px] text-left text-sm">
-                    <thead className="bg-white/[0.02] text-[11px] uppercase tracking-wider text-zinc-600">
-                      <tr>
-                        <th className="px-5 py-3 font-medium" scope="col">
-                          Release
-                        </th>
-                        <th className="px-4 py-3 font-medium" scope="col">
-                          Status
-                        </th>
-                        <th className="px-4 py-3 font-medium" scope="col">
-                          NFO
-                        </th>
-                        <th className="px-4 py-3 font-medium" scope="col">
-                          Progress
-                        </th>
-                        <th
-                          className="px-5 py-3 text-right font-medium"
-                          scope="col"
-                        >
-                          Action
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-white/[0.05]">
-                      {data.stuck_torrents.map((torrent) => (
-                        <tr
-                          className="transition hover:bg-white/[0.025]"
+                  <div>
+                    <div className="border-t border-white/[0.05] bg-sky-400/[0.025] px-5 py-3">
+                      <h3 className="text-xs font-semibold uppercase tracking-[0.16em] text-sky-300">
+                        NFO repair queue
+                      </h3>
+                      <p className="mt-1 text-[11px] text-zinc-600">
+                        {nfoRepairTorrents.length.toLocaleString()} NFO-only
+                        candidates
+                      </p>
+                    </div>
+                    {nfoRepairTorrents.length ? (
+                      nfoRepairTorrents.map((torrent) => (
+                        <TorrentCard
+                          dryRun={data.dry_run}
                           key={torrent.hash}
-                        >
-                          <td className="max-w-64 px-5 py-4">
-                            <p className="truncate font-medium text-zinc-200">
-                              {torrent.name}
-                            </p>
-                            <p className="mt-1 text-xs text-zinc-600">
-                              {torrent.category}
-                            </p>
-                          </td>
-                          <td className="max-w-64 px-4 py-4 text-xs text-zinc-400">
-                            <span className="block font-medium text-zinc-300">
-                              {torrent.state}
-                            </span>
-                            <span className="mt-1 block text-zinc-600">
-                              {reasonLabels[torrent.reason] ?? torrent.reason}
-                            </span>
-                          </td>
-                          <td className="max-w-64 px-4 py-4 text-xs text-zinc-400">
-                            {torrent.missing_nfo_count > 1 ? (
-                              <>
-                                <span className="block font-medium text-zinc-300">
-                                  {torrent.missing_nfo_count} NFO files
-                                </span>
-                                <span className="mt-1 block truncate text-zinc-600">
-                                  {torrent.missing_nfo_path}
-                                </span>
-                              </>
-                            ) : torrent.missing_nfo_path ? (
-                              <span className="block truncate">
-                                {torrent.missing_nfo_path}
-                              </span>
-                            ) : (
-                              <span className="text-zinc-700">—</span>
-                            )}
-                          </td>
-                          <td className="px-4 py-4 font-mono text-xs text-amber-300">
-                            {(torrent.progress * 100).toFixed(1)}%
-                          </td>
-                          <td className="px-5 py-4 text-right">
-                            {torrent.repairable ? (
-                              <Button
-                                aria-label={`${data.dry_run ? "Simulate repair" : "Repair"} ${torrent.name}`}
-                                disabled={
-                                  pendingAction === `repair-${torrent.hash}`
-                                }
-                                onClick={() =>
-                                  void runAction(
-                                    `repair-${torrent.hash}`,
-                                    `/api/torrents/${encodeURIComponent(torrent.hash)}/repair`,
-                                  )
-                                }
-                                type="button"
-                              >
-                                <RepairIcon className="size-4" />
-                                {data.dry_run ? "Simulate repair" : "Repair"}
-                              </Button>
-                            ) : (
-                              <span className="text-xs text-zinc-600">
-                                Not NFO-only
-                              </span>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                          onRepair={() =>
+                            void runAction(
+                              `repair-${torrent.hash}`,
+                              `/api/torrents/${encodeURIComponent(torrent.hash)}/repair`,
+                            )
+                          }
+                          pending={pendingAction === `repair-${torrent.hash}`}
+                          torrent={torrent}
+                        />
+                      ))
+                    ) : (
+                      <p className="border-t border-white/[0.05] px-5 py-6 text-sm text-zinc-600">
+                        No NFO-only repair candidates right now.
+                      </p>
+                    )}
+
+                    {otherIncompleteTorrents.length ? (
+                      <>
+                        <div className="border-t border-white/[0.05] bg-zinc-950/30 px-5 py-3">
+                          <h3 className="text-xs font-semibold uppercase tracking-[0.16em] text-zinc-400">
+                            Other incomplete downloads
+                          </h3>
+                          <p className="mt-1 text-[11px] text-zinc-600">
+                            Visible for context; crowdarr will not modify these.
+                          </p>
+                        </div>
+                        {otherIncompleteTorrents.map((torrent) => (
+                          <TorrentCard
+                            dryRun={data.dry_run}
+                            key={torrent.hash}
+                            onRepair={() => undefined}
+                            pending={false}
+                            torrent={torrent}
+                          />
+                        ))}
+                      </>
+                    ) : null}
+                  </div>
                 )}
               </section>
             </Panel>
