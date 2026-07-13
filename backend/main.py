@@ -7,7 +7,7 @@ import hmac
 import inspect
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
@@ -22,7 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from backend.connectors.health import ConnectorHealth, sanitized_error
-from backend.connectors.qbit import VIDEO_SUFFIXES, QBitConnector
+from backend.connectors.qbit import QBitConnector
 from backend.connectors.radarr import RadarrConnector
 from backend.connectors.sab import (
     SABCompletionEvent,
@@ -32,11 +32,10 @@ from backend.connectors.sab import (
 from backend.connectors.sonarr import SonarrConnector
 from backend.connectors.umlaut import UmlautAdaptarrConnector
 from backend.core.contribution import (
-    ContributionItem,
     ContributionService,
     CrowdNFOUploader,
 )
-from backend.core.files import PathMapper, PathMapping, atomic_write_bytes
+from backend.core.files import MismatchCleanupPolicy, PathMapper, PathMapping
 from backend.core.library import LibraryMediaItem
 from backend.core.mediainfo import MediaInfoRunner
 from backend.core.repair import TorrentRepairService
@@ -47,10 +46,16 @@ from backend.crowdnfo.client import CrowdNFOClient
 from backend.db.operations import OperationsStore
 from backend.db.settings import SettingsStore
 from backend.runtime import (
+    ActionQueueFull,
+    AsyncHashService,
     CrowdarrrRuntime,
     HealthConnector,
     InProcessActionQueue,
     OperationsRuntimeStore,
+    QBitCompletedPoller,
+    QBitLiveWorkflow,
+    SABLiveWorkflow,
+    StrategyAwareCrowdNFODownloader,
     WorkflowOutcome,
 )
 
@@ -60,24 +65,60 @@ _CONNECTOR_NAMES = frozenset(
     {"crowdnfo", "qbittorrent", "sabnzbd", "radarr", "sonarr", "umlautadaptarr"}
 )
 _COUNTER_NAMES = ("fetched", "repaired", "uploaded", "matches", "misses")
+_SAB_WEBHOOK_PATH = "/api/webhooks/sabnzbd"
+_SAB_WEBHOOK_SECRET_HEADER = "X-Crowdarrr-SAB-Secret"
+_DEFAULT_SAB_WEBHOOK_MAX_BYTES = 64 * 1024
+
+
+def _positive_int(value: str | None, *, default: int, name: str) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        LOGGER.warning("Ignoring invalid %s", name)
+        return default
+    if parsed < 1:
+        LOGGER.warning("Ignoring non-positive %s", name)
+        return default
+    return parsed
 
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     """Apply API bearer protection and browser hardening headers."""
 
-    def __init__(self, app: Any, *, api_token: str | None) -> None:
+    def __init__(
+        self,
+        app: Any,
+        *,
+        api_token: str | None,
+        api_token_provider: Callable[[], Awaitable[str | None]] | None,
+        sab_webhook_secret: str | None,
+        sab_webhook_max_bytes: int,
+    ) -> None:
         super().__init__(app)
         self._api_token = api_token or None
+        self._api_token_provider = api_token_provider
+        self._sab_webhook_secret = sab_webhook_secret or None
+        self._sab_webhook_max_bytes = sab_webhook_max_bytes
 
-    def _authorized(self, request: Request) -> bool:
+    @staticmethod
+    def _authorized(request: Request, api_token: str) -> bool:
         authorization = request.headers.get("Authorization", "")
         scheme, separator, credential = authorization.partition(" ")
         return bool(
             separator
             and scheme.casefold() == "bearer"
             and credential
-            and self._api_token is not None
-            and hmac.compare_digest(credential, self._api_token)
+            and hmac.compare_digest(credential, api_token)
+        )
+
+    def _sab_authorized(self, request: Request) -> bool:
+        credential = request.headers.get(_SAB_WEBHOOK_SECRET_HEADER, "")
+        return bool(
+            credential
+            and self._sab_webhook_secret is not None
+            and hmac.compare_digest(credential, self._sab_webhook_secret)
         )
 
     async def dispatch(
@@ -85,11 +126,71 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
+        is_sab_webhook = request.url.path == _SAB_WEBHOOK_PATH
         protected = request.url.path.startswith("/api") and request.url.path != (
             "/api/health"
         )
-        if self._api_token is not None and protected and not self._authorized(request):
+        api_token = self._api_token
+        token_provider_failed = False
+        if (
+            protected
+            and not is_sab_webhook
+            and api_token is None
+            and self._api_token_provider is not None
+        ):
+            try:
+                api_token = await self._api_token_provider()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                token_provider_failed = True
+                LOGGER.error(
+                    "application API token could not be loaded (%s)",
+                    sanitized_error(error),
+                )
+        if is_sab_webhook and self._sab_webhook_secret is None:
             response: Response = JSONResponse(
+                {"detail": "SAB webhook secret is not configured"},
+                status_code=503,
+            )
+        elif is_sab_webhook and not self._sab_authorized(request):
+            response = JSONResponse(
+                {"detail": "authentication required"}, status_code=401
+            )
+        elif is_sab_webhook:
+            raw_length = request.headers.get("Content-Length")
+            try:
+                content_length = int(raw_length) if raw_length is not None else None
+            except ValueError:
+                content_length = self._sab_webhook_max_bytes + 1
+            if (
+                content_length is not None
+                and content_length > self._sab_webhook_max_bytes
+            ):
+                response = JSONResponse(
+                    {"detail": "SAB webhook payload is too large"},
+                    status_code=413,
+                )
+            else:
+                body = await request.body()
+                if len(body) > self._sab_webhook_max_bytes:
+                    response = JSONResponse(
+                        {"detail": "SAB webhook payload is too large"},
+                        status_code=413,
+                    )
+                else:
+                    response = await call_next(request)
+        elif token_provider_failed:
+            response = JSONResponse(
+                {"detail": "security configuration is unavailable"},
+                status_code=503,
+            )
+        elif (
+            api_token is not None
+            and protected
+            and not self._authorized(request, api_token)
+        ):
+            response = JSONResponse(
                 {"detail": "authentication required"}, status_code=401
             )
         else:
@@ -97,6 +198,12 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'self'; connect-src 'self'; "
+            "form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; "
+            "object-src 'none'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'"
+        )
         response.headers["Permissions-Policy"] = (
             "camera=(), geolocation=(), microphone=()"
         )
@@ -154,121 +261,21 @@ class _ReleaseResolvingLibraryConnector:
         return resolved
 
 
-class _DefaultSABLiveService:
-    """Translate one SAB completion into live-in and live-out operations."""
-
-    def __init__(
-        self,
-        *,
-        settings: AppSettings,
-        path_mapper: PathMapper,
-        crowdnfo: CrowdNFOClient,
-        contribution: ContributionService,
-    ) -> None:
-        self._settings = settings
-        self._path_mapper = path_mapper
-        self._crowdnfo = crowdnfo
-        self._contribution = contribution
-        self._allowed_roots = tuple(
-            Path(mapping.local_root) for mapping in settings.path_mappings
-        )
-
-    def _inspect_release(
-        self, event: SABCompletionEvent
-    ) -> tuple[Path, Path, Path | None, list[dict[str, object]]]:
-        reported = self._path_mapper.map_path(event.remote_storage_path)
-        if reported.is_file():
-            root = reported.parent
-            media = reported
-        elif reported.is_dir():
-            root = reported
-            root_resolved = root.resolve(strict=True)
-            media_candidates = sorted(
-                candidate
-                for candidate in root.rglob("*")
-                if candidate.is_file()
-                and candidate.suffix.casefold() in VIDEO_SUFFIXES
-                and candidate.resolve(strict=True).is_relative_to(root_resolved)
-            )
-            if not media_candidates:
-                raise FileNotFoundError("completed SAB job contains no media file")
-            media = media_candidates[0]
-        else:
-            raise FileNotFoundError("completed SAB storage path is unavailable")
-
-        preferred_nfo = media.with_suffix(".nfo")
-        nfo_path: Path | None = preferred_nfo if preferred_nfo.is_file() else None
-        if nfo_path is None:
-            nfo_candidates = sorted(
-                candidate
-                for candidate in root.rglob("*.nfo")
-                if candidate.is_file()
-                and candidate.resolve(strict=True).is_relative_to(
-                    root.resolve(strict=True)
-                )
-            )
-            nfo_path = nfo_candidates[0] if nfo_candidates else None
-
-        filelist = [
-            {
-                "file_path": path.relative_to(root).as_posix(),
-                "file_size_bytes": path.stat().st_size,
-            }
-            for path in sorted(root.rglob("*"))
-            if path.is_file()
-            and path.resolve(strict=True).is_relative_to(root.resolve(strict=True))
-        ]
-        return root, media, nfo_path, filelist
-
-    async def fetch_missing(self, event: SABCompletionEvent) -> object:
-        _, media, nfo_path, _ = await asyncio.to_thread(self._inspect_release, event)
-        if nfo_path is not None and nfo_path.stat().st_size > 0:
-            return nfo_path
-        target = media.with_suffix(".nfo")
-        if self._settings.dry_run:
-            return target
-        payload = await self._crowdnfo.download_nfo(
-            release_name=event.release_name,
-            media_sha256=None,
-        )
-        if not payload:
-            raise ValueError("downloaded nfo is empty")
-        return await asyncio.to_thread(
-            atomic_write_bytes,
-            target,
-            payload,
-            allowed_roots=self._allowed_roots,
-            overwrite=False,
-        )
-
-    async def contribute(self, event: SABCompletionEvent) -> object:
-        _, media, nfo_path, filelist = await asyncio.to_thread(
-            self._inspect_release, event
-        )
-        if self._settings.dry_run:
-            return None
-        return await self._contribution.contribute(
-            ContributionItem(
-                release_name=event.release_name,
-                media_path=media,
-                nfo_path=nfo_path,
-                source_category=event.category,
-                filelist=filelist,
-            ),
-            include_nfo=self._settings.contribute.nfo,
-            include_mediainfo=self._settings.contribute.mediainfo,
-            include_filelist=self._settings.contribute.filelist,
-        )
-
-
 @dataclass(slots=True)
 class _RuntimeBundle:
     runtime: CrowdarrrRuntime
     queue: InProcessActionQueue
     health_connectors: dict[str, HealthConnector]
     closeables: tuple[object, ...]
+    qbit_poller: QBitCompletedPoller | None = None
+
+    def start(self) -> None:
+        if self.qbit_poller is not None:
+            self.qbit_poller.start()
 
     async def close(self) -> None:
+        if self.qbit_poller is not None:
+            await self.qbit_poller.close()
         await self.queue.close()
         seen: set[int] = set()
         for closeable in self.closeables:
@@ -425,6 +432,15 @@ class _DefaultServices:
         path_mapper = self._path_mapper(settings)
         closeables: list[object] = []
         health: dict[str, HealthConnector] = {}
+        hash_service = AsyncHashService(
+            cache=self.operations,
+            max_size_bytes=settings.hash_max_size_bytes,
+            max_concurrency=_positive_int(
+                os.getenv("CROWDARRR_HASH_MAX_CONCURRENCY"),
+                default=2,
+                name="CROWDARRR_HASH_MAX_CONCURRENCY",
+            ),
+        )
 
         crowdnfo: CrowdNFOClient | None
         try:
@@ -438,6 +454,14 @@ class _DefaultServices:
         if crowdnfo is not None:
             closeables.append(crowdnfo)
             health["crowdnfo"] = _CrowdNFOHealth(crowdnfo)
+        crowdnfo_downloader = (
+            StrategyAwareCrowdNFODownloader(
+                client=crowdnfo,
+                mode=settings.match_strategy,
+            )
+            if crowdnfo is not None
+            else None
+        )
 
         qbit: QBitConnector | None = None
         qbit_url = self._url(settings.qbittorrent.base_url)
@@ -522,30 +546,44 @@ class _DefaultServices:
 
         repair = (
             TorrentRepairService(
-                crowdnfo=crowdnfo,
+                crowdnfo=crowdnfo_downloader,
                 qbit=qbit,
                 path_mapper=path_mapper,
                 allowed_roots=[
                     Path(mapping.local_root) for mapping in settings.path_mappings
                 ],
                 dry_run=settings.dry_run,
+                auto_recheck=settings.auto_recheck,
+                hash_service=(
+                    hash_service
+                    if settings.match_strategy != "release_name_only"
+                    else None
+                ),
+                keep_mismatch=(
+                    settings.nfo_mismatch_policy is MismatchCleanupPolicy.KEEP
+                ),
             )
-            if crowdnfo is not None and qbit is not None and path_mapper is not None
+            if (
+                crowdnfo_downloader is not None
+                and qbit is not None
+                and path_mapper is not None
+            )
             else None
         )
 
+        fetch_enabled = mode_allows_trigger(
+            settings.download_mode,
+            ScanTrigger.NEW_DOWNLOAD,
+        )
+        contribute_enabled = settings.contribute.enabled
         sab_webhook: SABWebhookHandler | None = None
+        qbit_poller: QBitCompletedPoller | None = None
         if (
-            sab is not None
-            and crowdnfo is not None
+            crowdnfo is not None
+            and crowdnfo_downloader is not None
             and path_mapper is not None
-            and (
-                mode_allows_trigger(
-                    settings.download_mode,
-                    ScanTrigger.NEW_DOWNLOAD,
-                )
-                or settings.contribute.enabled
-            )
+            and (sab is not None or qbit is not None)
+            and (fetch_enabled or contribute_enabled)
         ):
             mapping = {
                 "radarr": "Movies",
@@ -571,35 +609,76 @@ class _DefaultServices:
                 mediainfo=MediaInfoRunner(),
                 category_mapping=mapping,
             )
-            live_service = _DefaultSABLiveService(
+            live_workflow = SABLiveWorkflow(
                 settings=settings,
                 path_mapper=path_mapper,
-                crowdnfo=crowdnfo,
+                crowdnfo=crowdnfo_downloader,
                 contribution=contribution,
+                hash_service=hash_service,
             )
-            sab_webhook = SABWebhookHandler(
-                live_service=live_service,
-                fetch_enabled=mode_allows_trigger(
-                    settings.download_mode,
-                    ScanTrigger.NEW_DOWNLOAD,
-                ),
-                contribute_enabled=settings.contribute.enabled,
-            )
+            if sab is not None:
+                sab_webhook = SABWebhookHandler(
+                    live_service=live_workflow,
+                    fetch_enabled=fetch_enabled,
+                    contribute_enabled=contribute_enabled,
+                )
+            if qbit is not None:
+                qbit_poller = QBitCompletedPoller(
+                    qbit=qbit,
+                    live_service=QBitLiveWorkflow(live_workflow),
+                    store=self.operations,
+                    fetch_enabled=fetch_enabled,
+                    contribute_enabled=contribute_enabled,
+                    poll_interval=float(
+                        _positive_int(
+                            os.getenv("CROWDARRR_QBIT_POLL_INTERVAL_SECONDS"),
+                            default=30,
+                            name="CROWDARRR_QBIT_POLL_INTERVAL_SECONDS",
+                        )
+                    ),
+                )
 
-        queue = InProcessActionQueue(store=self.store)
+        queue = InProcessActionQueue(
+            store=self.store,
+            max_concurrency=_positive_int(
+                os.getenv("CROWDARRR_ACTION_MAX_CONCURRENCY"),
+                default=2,
+                name="CROWDARRR_ACTION_MAX_CONCURRENCY",
+            ),
+            max_pending=_positive_int(
+                os.getenv("CROWDARRR_ACTION_MAX_PENDING"),
+                default=64,
+                name="CROWDARRR_ACTION_MAX_PENDING",
+            ),
+        )
         runtime = CrowdarrrRuntime(
             settings=settings,
             store=self.store,
             qbit=qbit,
             repair_service=repair,
-            crowdnfo=crowdnfo,
+            crowdnfo=crowdnfo_downloader,
             library_connectors=library_connectors,
             sab_webhook=sab_webhook,
+            sab_history=sab if sab_webhook is not None else None,
             health_connectors=health,
             action_queue=queue,
+            hash_service=hash_service,
+            healthcheck_timeout=float(
+                _positive_int(
+                    os.getenv("CROWDARRR_HEALTHCHECK_TIMEOUT_SECONDS"),
+                    default=5,
+                    name="CROWDARRR_HEALTHCHECK_TIMEOUT_SECONDS",
+                )
+            ),
         )
         queue.bind(runtime)
-        return _RuntimeBundle(runtime, queue, health, tuple(closeables))
+        return _RuntimeBundle(
+            runtime,
+            queue,
+            health,
+            tuple(closeables),
+            qbit_poller,
+        )
 
     async def reload_runtime(self) -> None:
         async with self._reload_lock:
@@ -609,6 +688,7 @@ class _DefaultServices:
             self.bundle = replacement
             if previous is not None:
                 await previous.close()
+            replacement.start()
             self._configure_backfill(settings)
 
     def _configure_backfill(self, settings: AppSettings) -> None:
@@ -624,7 +704,7 @@ class _DefaultServices:
         if runtime is None:
             return
         try:
-            await runtime.full_backfill()
+            await runtime.enqueue_scheduled_backfill()
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -679,7 +759,12 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def create_app(*, services: Any | None = None, api_token: str | None = None) -> FastAPI:
+def create_app(
+    *,
+    services: Any | None = None,
+    api_token: str | None = None,
+    sab_webhook_secret: str | None = None,
+) -> FastAPI:
     """Create an app around injectable services for runtime and isolated tests."""
 
     if services is None:
@@ -688,6 +773,18 @@ def create_app(*, services: Any | None = None, api_token: str | None = None) -> 
     else:
         owned_services = None
         service_container = services
+
+    async def stored_api_token() -> str | None:
+        settings_service = getattr(service_container, "settings", None)
+        getter = getattr(settings_service, "get", None)
+        if not callable(getter):
+            return None
+        loaded = getter()
+        settings = await loaded if inspect.isawaitable(loaded) else loaded
+        secret = getattr(settings, "application_api_token", None)
+        reveal = getattr(secret, "get_secret_value", None)
+        value = reveal() if callable(reveal) else secret
+        return str(value) if value else None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -710,7 +807,23 @@ def create_app(*, services: Any | None = None, api_token: str | None = None) -> 
     effective_token = (
         api_token if api_token is not None else os.getenv("CROWDARRR_API_TOKEN")
     )
-    application.add_middleware(SecurityMiddleware, api_token=effective_token)
+    effective_sab_secret = (
+        sab_webhook_secret
+        if sab_webhook_secret is not None
+        else os.getenv("CROWDARRR_SAB_WEBHOOK_SECRET")
+    )
+    sab_webhook_max_bytes = _positive_int(
+        os.getenv("CROWDARRR_SAB_WEBHOOK_MAX_BYTES"),
+        default=_DEFAULT_SAB_WEBHOOK_MAX_BYTES,
+        name="CROWDARRR_SAB_WEBHOOK_MAX_BYTES",
+    )
+    application.add_middleware(
+        SecurityMiddleware,
+        api_token=effective_token,
+        api_token_provider=stored_api_token,
+        sab_webhook_secret=effective_sab_secret,
+        sab_webhook_max_bytes=sab_webhook_max_bytes,
+    )
 
     @application.get("/api/health")
     async def health() -> dict[str, str]:
@@ -738,18 +851,39 @@ def create_app(*, services: Any | None = None, api_token: str | None = None) -> 
         return updated
 
     @application.post("/api/actions/scan-repair", status_code=202)
-    async def scan_repair() -> dict[str, str]:
-        job_id = await service_container.actions.scan_repair()
+    async def scan_repair() -> Any:
+        try:
+            job_id = await service_container.actions.scan_repair()
+        except ActionQueueFull:
+            return JSONResponse(
+                {"detail": "action queue is full"},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         return {"job_id": str(job_id), "status": "accepted"}
 
     @application.post("/api/torrents/{torrent_hash}/repair", status_code=202)
-    async def repair_torrent(torrent_hash: str) -> dict[str, str]:
-        job_id = await service_container.actions.repair_torrent(torrent_hash)
+    async def repair_torrent(torrent_hash: str) -> Any:
+        try:
+            job_id = await service_container.actions.repair_torrent(torrent_hash)
+        except ActionQueueFull:
+            return JSONResponse(
+                {"detail": "action queue is full"},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         return {"job_id": str(job_id), "status": "accepted"}
 
     @application.post("/api/actions/misses/{miss_id}/retry", status_code=202)
-    async def retry_miss(miss_id: str) -> dict[str, str]:
-        job_id = await service_container.actions.retry_miss(miss_id)
+    async def retry_miss(miss_id: str) -> Any:
+        try:
+            job_id = await service_container.actions.retry_miss(miss_id)
+        except ActionQueueFull:
+            return JSONResponse(
+                {"detail": "action queue is full"},
+                status_code=503,
+                headers={"Retry-After": "1"},
+            )
         return {"job_id": str(job_id), "status": "accepted"}
 
     @application.post("/api/webhooks/sabnzbd")
@@ -779,7 +913,10 @@ def create_app(*, services: Any | None = None, api_token: str | None = None) -> 
                 status_code=422,
             )
         result = handler(event)
-        return _jsonable(await result if inspect.isawaitable(result) else result)
+        resolved = await result if inspect.isawaitable(result) else result
+        if isinstance(resolved, WorkflowOutcome) and resolved.status == "failed":
+            return JSONResponse(_jsonable(resolved), status_code=422)
+        return _jsonable(resolved)
 
     @application.post("/api/connectors/{connector}/test")
     async def test_connector(connector: str) -> Any:

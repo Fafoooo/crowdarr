@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -11,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+_BUSY_TIMEOUT_MS = 5_000
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _utc_now() -> datetime:
@@ -24,6 +28,10 @@ def _load_json(value: str | None) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ValueError("stored operation JSON must be an object")
     return decoded
+
+
+def _cache_path(path: Path) -> str:
+    return str(Path(path).resolve(strict=False))
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,9 +63,12 @@ class OperationsStore:
 
     async def _connect(self) -> aiosqlite.Connection:
         self._database.parent.mkdir(parents=True, exist_ok=True)
-        connection = await aiosqlite.connect(self._database)
-        await connection.execute("PRAGMA journal_mode=DELETE")
-        await connection.execute("PRAGMA synchronous=FULL")
+        connection = await aiosqlite.connect(
+            self._database,
+            timeout=_BUSY_TIMEOUT_MS / 1_000,
+        )
+        await connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        await connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
     async def _initialize_unlocked(self) -> None:
@@ -65,6 +76,11 @@ class OperationsStore:
             return
         connection = await self._connect()
         try:
+            cursor = await connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = await cursor.fetchone()
+            await cursor.close()
+            if journal_mode is None or str(journal_mode[0]).casefold() != "wal":
+                raise RuntimeError("SQLite WAL mode could not be enabled")
             await connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS activity (
@@ -97,7 +113,36 @@ class OperationsStore:
                     idempotency_key TEXT PRIMARY KEY,
                     completed_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS file_hash_cache (
+                    path TEXT NOT NULL,
+                    size INTEGER NOT NULL CHECK (size >= 0),
+                    mtime_ns INTEGER NOT NULL CHECK (mtime_ns >= 0),
+                    sha256 TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(path, size, mtime_ns)
+                );
+                CREATE INDEX IF NOT EXISTS ix_file_hash_cache_updated_at
+                    ON file_hash_cache(updated_at DESC);
                 """
+            )
+            now = _utc_now().isoformat()
+            await connection.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed',
+                    result = ?,
+                    updated_at = ?
+                WHERE status = 'running'
+                """,
+                (
+                    json.dumps(
+                        {"detail": "interrupted by application restart"},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
             )
             await connection.commit()
         finally:
@@ -370,6 +415,73 @@ class OperationsStore:
                     ) VALUES (?, ?)
                     """,
                     (key, _utc_now().isoformat()),
+                )
+                await connection.commit()
+            finally:
+                await connection.close()
+
+    async def get_file_hash(
+        self,
+        *,
+        path: Path,
+        size: int,
+        mtime_ns: int,
+    ) -> str | None:
+        if size < 0 or mtime_ns < 0:
+            raise ValueError("file hash cache metadata cannot be negative")
+        cache_path = _cache_path(path)
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                cursor = await connection.execute(
+                    """
+                    SELECT sha256
+                    FROM file_hash_cache
+                    WHERE path = ? AND size = ? AND mtime_ns = ?
+                    """,
+                    (cache_path, size, mtime_ns),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+            finally:
+                await connection.close()
+        return str(row[0]) if row is not None else None
+
+    async def put_file_hash(
+        self,
+        *,
+        path: Path,
+        size: int,
+        mtime_ns: int,
+        sha256: str,
+    ) -> None:
+        if size < 0 or mtime_ns < 0:
+            raise ValueError("file hash cache metadata cannot be negative")
+        if not _SHA256.fullmatch(sha256):
+            raise ValueError("sha256 must be a complete SHA-256 digest")
+        cache_path = _cache_path(path)
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                await connection.execute(
+                    "DELETE FROM file_hash_cache WHERE path = ?",
+                    (cache_path,),
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO file_hash_cache(
+                        path, size, mtime_ns, sha256, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cache_path,
+                        size,
+                        mtime_ns,
+                        sha256.casefold(),
+                        _utc_now().isoformat(),
+                    ),
                 )
                 await connection.commit()
             finally:

@@ -61,6 +61,16 @@ def _release_hashes(release: object) -> set[str]:
         if isinstance(value, str) and value:
             hashes.add(value.casefold())
 
+    media_hashes = _field(release, "media_hashes")
+    if isinstance(media_hashes, (Sequence, set, frozenset)) and not isinstance(
+        media_hashes, (str, bytes)
+    ):
+        hashes.update(
+            value.casefold()
+            for value in media_hashes
+            if isinstance(value, str) and value
+        )
+
     variants = _field(release, "variants")
     if isinstance(variants, Sequence) and not isinstance(variants, (str, bytes)):
         for variant in variants:

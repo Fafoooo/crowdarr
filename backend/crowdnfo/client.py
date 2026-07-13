@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,8 @@ from urllib.parse import quote
 import httpx
 
 from backend.crowdnfo.endpoints import DEFAULT_CONTRACT, CrowdNFOContract
+
+LOGGER = logging.getLogger(__name__)
 
 
 class UnsupportedLookupError(RuntimeError):
@@ -25,7 +28,39 @@ class CrowdNFOFileMetadata:
     original_file_name: str | None = None
     file_size_bytes: int | None = None
     file_type: str | None = None
+    media_hashes: frozenset[str] = frozenset()
+    hash_verified: bool = False
     raw: Mapping[str, Any] | None = None
+
+
+def _media_hashes(payload: Mapping[str, Any]) -> frozenset[str]:
+    hashes: set[str] = set()
+    fields = (
+        "fileHash",
+        "FileHash",
+        "file_hash",
+        "mediaSha256",
+        "media_sha256",
+        "canonicalFileHash",
+        "canonical_file_hash",
+    )
+
+    def collect(value: object) -> None:
+        if not isinstance(value, Mapping):
+            return
+        for field in fields:
+            candidate = value.get(field)
+            if isinstance(candidate, str) and len(candidate) == 64:
+                hashes.add(candidate.casefold())
+        variants = value.get("variants")
+        if isinstance(variants, Sequence) and not isinstance(variants, (str, bytes)):
+            for variant in variants:
+                collect(variant)
+        release = value.get("release")
+        collect(release)
+
+    collect(payload)
+    return frozenset(hashes)
 
 
 class CrowdNFOClient:
@@ -151,6 +186,20 @@ class CrowdNFOClient:
         if not isinstance(data, Mapping) or not data.get("fileId"):
             raise ValueError("CrowdNFO best-file response did not contain fileId")
         size = data.get("fileSizeBytes")
+        hashes = _media_hashes(data)
+        hash_verified = False
+        if media_sha256 is not None:
+            requested_hash = media_sha256.casefold()
+            if hashes and requested_hash not in hashes:
+                raise LookupError(
+                    "CrowdNFO release-name result has a different media hash"
+                )
+            hash_verified = requested_hash in hashes
+            if not hashes:
+                LOGGER.info(
+                    "CrowdNFO name lookup returned no verifiable media hash; "
+                    "using release-name fallback"
+                )
         return CrowdNFOFileMetadata(
             file_id=str(data["fileId"]),
             original_file_name=(
@@ -160,6 +209,8 @@ class CrowdNFOClient:
             ),
             file_size_bytes=int(size) if size is not None else None,
             file_type=str(data["fileType"]) if data.get("fileType") else None,
+            media_hashes=hashes,
+            hash_verified=hash_verified,
             raw=data,
         )
 
