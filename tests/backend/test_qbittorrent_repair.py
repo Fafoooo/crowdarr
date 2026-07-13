@@ -1,0 +1,327 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+import pytest
+
+from backend.connectors.qbit import TorrentFile, TorrentSnapshot, find_stuck_nfos
+from backend.core.repair import RepairStatus, TorrentRepairService
+
+
+VIDEO_SIZE = 8_000_000_000
+
+
+def make_snapshot(
+    *,
+    torrent_progress: float = 0.999,
+    nfo_progress: float = 0.0,
+    video_progress: float = 0.9999,
+    state: str = "stalledDL",
+    include_video: bool = True,
+) -> TorrentSnapshot:
+    files = [
+        TorrentFile(
+            index=7,
+            path="Release.Name/Release.Name.nfo",
+            size=42_000,
+            progress=nfo_progress,
+            priority=0,
+        )
+    ]
+    if include_video:
+        files.append(
+            TorrentFile(
+                index=8,
+                path="Release.Name/Release.Name.mkv",
+                size=VIDEO_SIZE,
+                progress=video_progress,
+                priority=1,
+            )
+        )
+    return TorrentSnapshot(
+        torrent_hash="deadbeef",
+        name="Release.Name.2026-GROUP",
+        category="cross-seed-link",
+        content_path="/data/cross-seeds",
+        progress=torrent_progress,
+        state=state,
+        files=files,
+    )
+
+
+def test_detects_incomplete_nfo_only_when_video_is_nearly_complete() -> None:
+    missing = find_stuck_nfos(make_snapshot(), video_threshold=0.99)
+
+    assert len(missing) == 1
+    assert missing[0].torrent_hash == "deadbeef"
+    assert missing[0].torrent_name == "Release.Name.2026-GROUP"
+    assert missing[0].file_index == 7
+    assert missing[0].relative_path == PurePosixPath(
+        "Release.Name/Release.Name.nfo"
+    )
+    assert missing[0].reported_path == PurePosixPath(
+        "/data/cross-seeds/Release.Name/Release.Name.nfo"
+    )
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        make_snapshot(video_progress=0.80),
+        make_snapshot(nfo_progress=1.0),
+        make_snapshot(torrent_progress=1.0, nfo_progress=1.0),
+        make_snapshot(include_video=False),
+    ],
+    ids=["video-incomplete", "nfo-complete", "torrent-complete", "no-video"],
+)
+def test_stuck_detection_rejects_false_positives(snapshot: TorrentSnapshot) -> None:
+    assert find_stuck_nfos(snapshot, video_threshold=0.99) == []
+
+
+class FakeCrowdNFO:
+    def __init__(self, payload: bytes, events: list[tuple[Any, ...]]) -> None:
+        self.payload = payload
+        self.events = events
+
+    async def download_nfo(
+        self, *, release_name: str, media_sha256: str | None = None
+    ) -> bytes:
+        self.events.append(("download", release_name, media_sha256))
+        return self.payload
+
+
+class FakePathMapper:
+    def __init__(self, local_data: Path) -> None:
+        self.local_data = local_data
+
+    def map_path(self, reported_path: str | PurePosixPath) -> Path:
+        reported = PurePosixPath(reported_path)
+        assert reported.is_relative_to(PurePosixPath("/data"))
+        return self.local_data.joinpath(*reported.relative_to("/data").parts)
+
+
+class RecordingWriter:
+    def __init__(self, events: list[tuple[Any, ...]]) -> None:
+        self.events = events
+
+    def __call__(self, path: Path, payload: bytes, *, overwrite: bool) -> bool:
+        self.events.append(("write", path, payload, overwrite))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return True
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def monotonic(self) -> float:
+        return self.value
+
+    async def sleep(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class FakeQBit:
+    def __init__(
+        self,
+        states: list[TorrentSnapshot],
+        events: list[tuple[Any, ...]],
+        *,
+        resumed_state: TorrentSnapshot | None = None,
+    ) -> None:
+        self.states = states
+        self.events = events
+        self.resumed_state = resumed_state
+
+    async def set_file_priority(
+        self, torrent_hash: str, file_ids: list[int], priority: int
+    ) -> None:
+        self.events.append(("priority", torrent_hash, file_ids, priority))
+
+    async def force_recheck(self, torrent_hash: str) -> None:
+        self.events.append(("recheck", torrent_hash))
+
+    async def get_torrent(self, torrent_hash: str) -> TorrentSnapshot:
+        self.events.append(("poll", torrent_hash))
+        if len(self.states) > 1:
+            return self.states.pop(0)
+        return self.states[0]
+
+    async def resume(self, torrent_hash: str) -> TorrentSnapshot:
+        self.events.append(("resume", torrent_hash))
+        assert self.resumed_state is not None
+        return self.resumed_state
+
+
+def checking_snapshot() -> TorrentSnapshot:
+    return make_snapshot(state="checkingUP", nfo_progress=0.0)
+
+
+def checked_snapshot(*, matched: bool) -> TorrentSnapshot:
+    return make_snapshot(
+        torrent_progress=1.0 if matched else 0.999,
+        nfo_progress=1.0 if matched else 0.25,
+        state="pausedUP",
+    )
+
+
+def seeding_snapshot() -> TorrentSnapshot:
+    return make_snapshot(
+        torrent_progress=1.0,
+        nfo_progress=1.0,
+        state="uploading",
+    )
+
+
+def make_service(
+    *,
+    local_data: Path,
+    qbit: FakeQBit,
+    crowdnfo: FakeCrowdNFO,
+    writer: Callable[..., bool],
+    clock: FakeClock,
+    dry_run: bool = False,
+    keep_mismatch: bool = True,
+) -> TorrentRepairService:
+    return TorrentRepairService(
+        crowdnfo=crowdnfo,
+        qbit=qbit,
+        path_mapper=FakePathMapper(local_data),
+        atomic_writer=writer,
+        poll_interval=1.0,
+        recheck_timeout=2.0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        dry_run=dry_run,
+        keep_mismatch=keep_mismatch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_repair_writes_expected_path_then_rechecks_resumes_and_seeds(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    local_data = tmp_path / "data"
+    media_path = local_data / "cross-seeds/Release.Name/Release.Name.mkv"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(b"never mutate this media")
+    original_media = media_path.read_bytes()
+    nfo_bytes = b"\xffExact\r\nNFO\r\n"
+    qbit = FakeQBit(
+        [checking_snapshot(), checked_snapshot(matched=True)],
+        events,
+        resumed_state=seeding_snapshot(),
+    )
+    service = make_service(
+        local_data=local_data,
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(nfo_bytes, events),
+        writer=RecordingWriter(events),
+        clock=FakeClock(),
+    )
+    candidate = find_stuck_nfos(make_snapshot())[0]
+
+    result = await service.repair(candidate)
+
+    expected_nfo = local_data / "cross-seeds/Release.Name/Release.Name.nfo"
+    assert result.status is RepairStatus.SUCCESS
+    assert result.verified is True
+    assert result.seeding is True
+    assert result.target_path == expected_nfo
+    assert expected_nfo.read_bytes() == nfo_bytes
+    assert media_path.read_bytes() == original_media
+    assert [event[0] for event in events] == [
+        "download",
+        "write",
+        "priority",
+        "recheck",
+        "poll",
+        "poll",
+        "resume",
+    ]
+    assert events[2] == ("priority", "deadbeef", [7], 1)
+
+
+@pytest.mark.asyncio
+async def test_repair_reports_mismatch_and_removes_only_downloaded_nfo(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    local_data = tmp_path / "data"
+    media_path = local_data / "cross-seeds/Release.Name/Release.Name.mkv"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(b"media stays intact")
+    qbit = FakeQBit([checking_snapshot(), checked_snapshot(matched=False)], events)
+    service = make_service(
+        local_data=local_data,
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(b"wrong bytes", events),
+        writer=RecordingWriter(events),
+        clock=FakeClock(),
+        keep_mismatch=False,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    expected_nfo = local_data / "cross-seeds/Release.Name/Release.Name.nfo"
+    assert result.status is RepairStatus.MISMATCH
+    assert result.retryable is True
+    assert "nfo mismatch" in result.message.lower()
+    assert not expected_nfo.exists()
+    assert media_path.read_bytes() == b"media stays intact"
+    assert "resume" not in [event[0] for event in events]
+
+
+@pytest.mark.asyncio
+async def test_repair_timeout_is_retryable_and_never_touches_media(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    local_data = tmp_path / "data"
+    media_path = local_data / "cross-seeds/Release.Name/Release.Name.mkv"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(b"untouched")
+    qbit = FakeQBit([checking_snapshot()], events)
+    service = make_service(
+        local_data=local_data,
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(b"candidate nfo", events),
+        writer=RecordingWriter(events),
+        clock=FakeClock(),
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert result.status is RepairStatus.TIMEOUT
+    assert result.retryable is True
+    assert media_path.read_bytes() == b"untouched"
+    assert "resume" not in [event[0] for event in events]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_reports_mapped_target_without_download_write_or_qbit_mutation(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    local_data = tmp_path / "data"
+    service = make_service(
+        local_data=local_data,
+        qbit=FakeQBit([checking_snapshot()], events),
+        crowdnfo=FakeCrowdNFO(b"unused", events),
+        writer=RecordingWriter(events),
+        clock=FakeClock(),
+        dry_run=True,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert result.status is RepairStatus.DRY_RUN
+    assert result.target_path == (
+        local_data / "cross-seeds/Release.Name/Release.Name.nfo"
+    )
+    assert events == []
+    assert not result.target_path.exists()
