@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from backend import main as main_module
 from backend.core.files import MismatchCleanupPolicy
 from backend.core.settings import AppSettings, DownloadMode, SettingsPatch
-from backend.db.settings import SettingsStore
+from backend.db.settings import SettingsEncryptionError, SettingsStore
 from backend.main import create_app
 
 
@@ -70,6 +70,19 @@ async def test_settings_defaults_are_complete_generic_and_persisted(
     assert persisted.dry_run is False
     assert persisted.backfill_cron == "15 4 * * 1"
     assert persisted.nfo_mismatch_policy is MismatchCleanupPolicy.REMOVE
+
+
+@pytest.mark.asyncio
+async def test_invalid_master_key_fails_fast_before_settings_are_used(
+    tmp_path: Path,
+) -> None:
+    store = SettingsStore(
+        tmp_path / "settings.sqlite",
+        master_key="A" * 43,
+    )
+
+    with pytest.raises(SettingsEncryptionError, match="Fernet.generate_key"):
+        await store.initialize()
 
 
 @pytest.mark.parametrize(
@@ -176,6 +189,8 @@ def test_settings_patch_accepts_public_custom_connector_and_path_values() -> Non
     )
 
     assert patch.qbittorrent is not None
+    assert patch.crowdnfo is not None
+    assert str(patch.crowdnfo.base_url).rstrip("/") == "https://community.example"
     assert patch.path_mappings[0].remote_root == "/downloads"
     assert patch.category_mappings == {"movies": "radarr", "shows": "sonarr"}
 
@@ -196,6 +211,8 @@ async def test_secrets_are_write_only_encrypted_and_blank_updates_preserve_them(
                 "crowdnfo": {"api_key": "crowd-secret-value"},
                 "qbittorrent": {"password": "qbit-secret-value"},
                 "sabnzbd": {"api_key": "sab-secret-value"},
+                "radarr": {"api_key": "radarr-secret-value"},
+                "sonarr": {"api_key": "sonarr-secret-value"},
                 "application_api_token": "app-secret-value",
             }
         )
@@ -214,6 +231,8 @@ async def test_secrets_are_write_only_encrypted_and_blank_updates_preserve_them(
         "crowdnfo_api_key": True,
         "qbittorrent_password": True,
         "sabnzbd_api_key": True,
+        "radarr_api_key": True,
+        "sonarr_api_key": True,
         "application_api_token": True,
     }
 
@@ -223,6 +242,8 @@ async def test_secrets_are_write_only_encrypted_and_blank_updates_preserve_them(
                 "crowdnfo": {"api_key": ""},
                 "qbittorrent": {"password": ""},
                 "sabnzbd": {"api_key": ""},
+                "radarr": {"api_key": ""},
+                "sonarr": {"api_key": ""},
                 "application_api_token": "",
             }
         )
@@ -231,6 +252,8 @@ async def test_secrets_are_write_only_encrypted_and_blank_updates_preserve_them(
     assert retained.crowdnfo.api_key.get_secret_value() == "crowd-secret-value"
     assert retained.qbittorrent.password.get_secret_value() == "qbit-secret-value"
     assert retained.sabnzbd.api_key.get_secret_value() == "sab-secret-value"
+    assert retained.radarr.api_key.get_secret_value() == "radarr-secret-value"
+    assert retained.sonarr.api_key.get_secret_value() == "sonarr-secret-value"
     assert retained.application_api_token.get_secret_value() == "app-secret-value"
     await store.close()
 
@@ -240,6 +263,8 @@ async def test_secrets_are_write_only_encrypted_and_blank_updates_preserve_them(
         "crowd-secret-value",
         "qbit-secret-value",
         "sab-secret-value",
+        "radarr-secret-value",
+        "sonarr-secret-value",
         "app-secret-value",
     ):
         assert secret not in all_logs

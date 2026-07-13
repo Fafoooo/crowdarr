@@ -14,6 +14,7 @@ import type {
   ActivityItem,
   ConnectorHealth,
   DashboardData,
+  JobResponse,
 } from "../types";
 
 function errorMessage(error: unknown): string {
@@ -69,6 +70,7 @@ function normaliseDashboard(raw: unknown): DashboardData {
       repaired: typeof counters.repaired === "number" ? counters.repaired : 0,
       uploaded: typeof counters.uploaded === "number" ? counters.uploaded : 0,
     },
+    dry_run: typeof value.dry_run === "boolean" ? value.dry_run : true,
     recent_activity: Array.isArray(value.recent_activity)
       ? (value.recent_activity as DashboardData["recent_activity"])
       : [],
@@ -121,6 +123,24 @@ const metricLabels = [
   ["Misses", "misses"],
 ] as const;
 
+const JOB_POLL_INTERVAL_MS = 1_000;
+const JOB_POLL_ATTEMPTS = 310;
+
+function wait(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+async function waitForJob(jobId: string): Promise<JobResponse | undefined> {
+  for (let attempt = 0; attempt < JOB_POLL_ATTEMPTS; attempt += 1) {
+    const job = await apiRequest<JobResponse>(
+      `/api/jobs/${encodeURIComponent(jobId)}`,
+    );
+    if (job.status !== "queued" && job.status !== "running") return job;
+    await wait(JOB_POLL_INTERVAL_MS);
+  }
+  return undefined;
+}
+
 function activityAccent(item: ActivityItem): string {
   if (item.status === "success") return "bg-emerald-400";
   if (item.status === "warning") return "bg-amber-400";
@@ -134,6 +154,9 @@ export default function DashboardPage() {
   const [actionError, setActionError] = useState<string>();
   const [actionMessage, setActionMessage] = useState<string>();
   const [pendingAction, setPendingAction] = useState<string>();
+  const repairIsRunning =
+    pendingAction?.startsWith("repair-") &&
+    actionMessage === "Repair is running…";
 
   const loadDashboard = useCallback(async () => {
     setLoadError(undefined);
@@ -156,7 +179,35 @@ export default function DashboardPage() {
       const response = await apiRequest<ActionResponse>(path, {
         method: "POST",
       });
-      setActionMessage(response.message ?? "Action accepted");
+      if (data?.dry_run) {
+        setActionMessage(
+          "Simulation queued — dry run will not write files and will not recheck qBittorrent.",
+        );
+      } else if (key.startsWith("repair-") && response.job_id) {
+        setActionMessage("Repair is running…");
+        const job = await waitForJob(response.job_id);
+        if (job === undefined) {
+          setActionMessage(
+            "Repair is still running — check Recent activity for the result.",
+          );
+        } else {
+          await loadDashboard();
+          if (job.status === "success") {
+            setActionMessage("Repair completed successfully.");
+          } else if (job.status === "dry_run") {
+            setActionMessage(
+              "Repair finished as a dry-run simulation; no files were changed.",
+            );
+          } else {
+            setActionMessage(undefined);
+            setActionError(
+              `Repair ${job.status} — see Recent activity for the exact reason.`,
+            );
+          }
+        }
+      } else {
+        setActionMessage(response.message ?? "Action accepted");
+      }
     } catch (error) {
       setActionError(errorMessage(error));
     } finally {
@@ -177,7 +228,7 @@ export default function DashboardPage() {
             <RefreshIcon
               className={pendingAction === "scan" ? "animate-spin" : ""}
             />
-            Scan &amp; repair now
+            {data?.dry_run ? "Simulate scan" : "Scan & repair now"}
           </Button>
         }
         description="Repair incomplete releases, monitor every connector, and keep your NFO pipeline moving."
@@ -187,10 +238,20 @@ export default function DashboardPage() {
 
       {actionMessage ? (
         <div
-          className="flex items-center gap-2 rounded-xl border border-emerald-400/20 bg-emerald-400/[0.08] px-4 py-3 text-sm text-emerald-200"
+          className={`flex items-center gap-2 rounded-xl border px-4 py-3 text-sm ${
+            data?.dry_run
+              ? "border-amber-400/20 bg-amber-400/[0.08] text-amber-200"
+              : repairIsRunning
+                ? "border-sky-400/20 bg-sky-400/[0.08] text-sky-200"
+                : "border-emerald-400/20 bg-emerald-400/[0.08] text-emerald-200"
+          }`}
           role="status"
         >
-          <CheckIcon className="size-4" />
+          {repairIsRunning ? (
+            <RefreshIcon className="size-4 animate-spin" />
+          ) : (
+            <CheckIcon className="size-4" />
+          )}
           {actionMessage}
         </div>
       ) : null}
@@ -205,6 +266,19 @@ export default function DashboardPage() {
 
       {data ? (
         <>
+          {data.dry_run ? (
+            <aside
+              aria-label="Dry run status"
+              className="rounded-xl border border-amber-400/25 bg-amber-400/[0.09] px-4 py-3 text-sm text-amber-100"
+            >
+              <p className="font-semibold">Dry run is enabled</p>
+              <p className="mt-1 text-amber-200/80">
+                Repair actions are simulations: no files are written and
+                qBittorrent is not rechecked. Disable Dry run in Settings and
+                save before performing a real repair.
+              </p>
+            </aside>
+          ) : null}
           <section aria-label="Connector health" className="space-y-3">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-zinc-200">
@@ -295,7 +369,7 @@ export default function DashboardPage() {
                           </td>
                           <td className="px-5 py-4 text-right">
                             <Button
-                              aria-label={`Repair ${torrent.name}`}
+                              aria-label={`${data.dry_run ? "Simulate repair" : "Repair"} ${torrent.name}`}
                               disabled={
                                 pendingAction === `repair-${torrent.hash}`
                               }
@@ -308,7 +382,7 @@ export default function DashboardPage() {
                               type="button"
                             >
                               <RepairIcon className="size-4" />
-                              Repair
+                              {data.dry_run ? "Simulate repair" : "Repair"}
                             </Button>
                           </td>
                         </tr>

@@ -38,6 +38,7 @@ export interface StuckTorrent {
 export interface DashboardData {
   connectors: ConnectorHealth[];
   counters: DashboardCounters;
+  dry_run: boolean;
   recent_activity: ActivityItem[];
   stuck_torrents: StuckTorrent[];
 }
@@ -46,6 +47,20 @@ export interface ActionResponse {
   job_id: string;
   message?: string;
   status?: string;
+}
+
+export interface JobResponse {
+  job_id: string;
+  kind: string;
+  result: { detail?: string };
+  status:
+    | "queued"
+    | "running"
+    | "success"
+    | "partial"
+    | "failed"
+    | "skipped"
+    | "dry_run";
 }
 
 export type ConnectorId =

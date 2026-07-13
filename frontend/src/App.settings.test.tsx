@@ -171,9 +171,6 @@ describe("settings", () => {
     const qbittorrent = await screen.findByRole("group", {
       name: "qBittorrent",
     });
-    const url = within(qbittorrent).getByLabelText("URL");
-    await user.clear(url);
-    await user.type(url, "http://unsaved-qbit:8080");
     await user.click(
       within(qbittorrent).getByRole("button", {
         name: /test qBittorrent connection/i,
@@ -187,6 +184,53 @@ describe("settings", () => {
     expect(
       screen.getByText(/connection tests use .*saved settings/i),
     ).toHaveTextContent(/save changes before testing/i);
+  });
+
+  it("requires saving changed connection fields before testing", async () => {
+    installFetchMock({
+      "GET /api/settings": jsonResponse(settingsPublicView),
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    const qbittorrent = await screen.findByRole("group", {
+      name: "qBittorrent",
+    });
+    const url = within(qbittorrent).getByLabelText("URL");
+    await user.clear(url);
+    await user.type(url, "http://unsaved-qbit:8080");
+
+    const testButton = within(qbittorrent).getByRole("button", {
+      name: /test qBittorrent connection/i,
+    });
+    expect(testButton).toBeDisabled();
+    expect(testButton).toHaveTextContent(/save first/i);
+  });
+
+  it("does not claim CrowdNFO is connected without a persisted API key", async () => {
+    installFetchMock({
+      "GET /api/settings": jsonResponse({
+        ...settingsPublicView,
+        secrets_configured: {
+          ...settingsPublicView.secrets_configured,
+          crowdnfo_api_key: false,
+        },
+      }),
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    const testButton = await screen.findByRole("button", {
+      name: /test CrowdNFO connection/i,
+    });
+    expect(testButton).toBeDisabled();
+    expect(testButton).toHaveTextContent(/API key required/i);
+
+    await user.type(screen.getByLabelText("CrowdNFO API key"), "unsaved-key");
+    expect(testButton).toBeDisabled();
+    expect(testButton).toHaveTextContent(/save first/i);
   });
 
   it("offers only valid CrowdNFO categories instead of asking for a save path", async () => {
@@ -416,5 +460,29 @@ describe("settings", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       /CrowdNFO: API key rejected/i,
     );
+  });
+
+  it("renders an unhealthy HTTP-200 connector result as an error", async () => {
+    installFetchMock({
+      "GET /api/settings": jsonResponse(settingsPublicView),
+      "POST /api/connectors/crowdnfo/test": jsonResponse({
+        latency_ms: 12,
+        message: "authentication failed",
+        status: "unhealthy",
+      }),
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+    await user.click(
+      await screen.findByRole("button", {
+        name: /test CrowdNFO connection/i,
+      }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /CrowdNFO: authentication failed/i,
+    );
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 });

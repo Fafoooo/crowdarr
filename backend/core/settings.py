@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
 from pydantic import (
@@ -23,6 +24,19 @@ def _empty_secret() -> SecretStr:
     return SecretStr("")
 
 
+def _canonical_crowdnfo_base_url(value: object) -> object:
+    if value is None:
+        return value
+    parsed = urlsplit(str(value).strip())
+    if parsed.username or parsed.password:
+        raise ValueError("CrowdNFO base_url must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("CrowdNFO base_url must not contain query or fragment")
+    if parsed.path.rstrip("/") not in {"", "/api"}:
+        raise ValueError("CrowdNFO base_url must be the service root")
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -37,10 +51,20 @@ class CrowdNFOSettings(StrictModel):
     base_url: AnyHttpUrl = "https://crowdnfo.net"  # type: ignore[assignment]
     api_key: SecretStr = Field(default_factory=_empty_secret)
 
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def canonicalize_base_url(cls, value: object) -> object:
+        return _canonical_crowdnfo_base_url(value)
+
 
 class CrowdNFOPatch(StrictModel):
     base_url: AnyHttpUrl | None = None
     api_key: SecretStr | None = None
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def canonicalize_base_url(cls, value: object) -> object:
+        return _canonical_crowdnfo_base_url(value)
 
 
 class ConnectorSettings(StrictModel):

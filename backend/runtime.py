@@ -280,6 +280,7 @@ class DashboardStuckTorrent:
 class DashboardSnapshot:
     connectors: tuple[DashboardConnector, ...]
     counters: DashboardCounters
+    dry_run: bool
     recent_activity: tuple[DashboardActivity, ...]
     stuck_torrents: tuple[DashboardStuckTorrent, ...]
 
@@ -1472,6 +1473,7 @@ class CrowdarrrRuntime:
         return DashboardSnapshot(
             connectors=connectors,
             counters=DashboardCounters(**counters),
+            dry_run=self.settings.dry_run,
             recent_activity=tuple(
                 self._activity_from_mapping(item) for item in raw_activity
             ),

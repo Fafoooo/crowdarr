@@ -50,6 +50,7 @@ const dashboardResponse = {
     repaired: 9,
     uploaded: 14,
   },
+  dry_run: false,
   recent_activity: [
     {
       created_at: "2026-07-13T08:14:00Z",
@@ -174,6 +175,12 @@ describe("dashboard", () => {
           { status: 202 },
         );
       },
+      "GET /api/jobs/repair-9": jsonResponse({
+        job_id: "repair-9",
+        kind: "repair_torrent",
+        result: {},
+        status: "success",
+      }),
       "POST /api/actions/misses/miss-7/retry": () => {
         retryRequests += 1;
         return jsonResponse(
@@ -199,7 +206,9 @@ describe("dashboard", () => {
     );
     expect(repairRequests).toBe(1);
     await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent(/repair queued/i);
+      expect(screen.getByRole("status")).toHaveTextContent(
+        /repair completed successfully/i,
+      );
     });
 
     await user.click(
@@ -213,6 +222,90 @@ describe("dashboard", () => {
         /match retry queued/i,
       );
     });
+  });
+
+  it("makes dry-run repairs unmistakably simulations", async () => {
+    let repairRequests = 0;
+    installFetchMock({
+      "GET /api/dashboard": jsonResponse({
+        ...dashboardResponse,
+        dry_run: true,
+      }),
+      "POST /api/torrents/0123456789abcdef/repair": () => {
+        repairRequests += 1;
+        return jsonResponse(
+          { job_id: "simulation-9", status: "accepted" },
+          { status: 202 },
+        );
+      },
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    expect(await screen.findByText(/dry run is enabled/i)).toBeVisible();
+    expect(screen.getByText(/no files are written/i)).toBeVisible();
+    const simulate = screen.getByRole("button", {
+      name: /simulate repair Sample\.Release-GROUP/i,
+    });
+    await user.click(simulate);
+
+    expect(repairRequests).toBe(1);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      /simulation queued.*not write files.*not recheck qBittorrent/i,
+    );
+  });
+
+  it("surfaces a completed repair miss and refreshes recent activity", async () => {
+    let dashboardRequests = 0;
+    const miss = {
+      created_at: "2026-07-13T09:00:00Z",
+      id: "activity-miss",
+      message: "not found",
+      miss_id: "miss-new",
+      status: "warning",
+      title: "CrowdNFO miss",
+      type: "miss",
+    };
+    installFetchMock({
+      "GET /api/dashboard": () => {
+        dashboardRequests += 1;
+        return jsonResponse(
+          dashboardRequests === 1
+            ? dashboardResponse
+            : {
+                ...dashboardResponse,
+                recent_activity: [miss, ...dashboardResponse.recent_activity],
+              },
+        );
+      },
+      "POST /api/torrents/0123456789abcdef/repair": jsonResponse(
+        { job_id: "repair-miss", status: "accepted" },
+        { status: 202 },
+      ),
+      "GET /api/jobs/repair-miss": jsonResponse({
+        job_id: "repair-miss",
+        kind: "repair_torrent",
+        result: {},
+        status: "failed",
+      }),
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole("button", {
+        name: /repair Sample\.Release-GROUP/i,
+      }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /repair failed.*recent activity/i,
+    );
+    expect(await screen.findByText("CrowdNFO miss")).toBeVisible();
+    expect(screen.getByText("not found")).toBeVisible();
+    expect(dashboardRequests).toBe(2);
   });
 
   it("keeps all primary destinations keyboard-accessible in the compact shell", async () => {

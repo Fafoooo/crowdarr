@@ -13,6 +13,7 @@ from backend.connectors.health import ConnectorHealth
 from backend.connectors.sab import SABCompletionEvent
 from backend.core.library import LibraryMediaItem
 from backend.core.settings import AppSettings, ConnectorSettings
+from backend.db.settings import SettingsEncryptionError
 from backend.main import create_app
 from backend.runtime import ActionQueueFull, WorkflowOutcome
 
@@ -68,6 +69,16 @@ class ActionsStub:
         if self.full:
             raise ActionQueueFull("busy")
         return f"retry-{miss_id}"
+
+    async def job_status(self, job_id: str) -> dict[str, Any]:
+        if job_id == "missing":
+            raise KeyError(job_id)
+        return {
+            "job_id": job_id,
+            "kind": "repair_torrent",
+            "status": "success",
+            "result": {},
+        }
 
 
 class ConnectorsStub:
@@ -188,11 +199,17 @@ async def test_torrent_repair_and_miss_retry_return_trackable_jobs() -> None:
     async with client_for(app) as client:
         repair = await client.post("/api/torrents/abc123/repair")
         retry = await client.post("/api/actions/misses/miss-7/retry")
+        job = await client.get("/api/jobs/repair-abc123")
+        missing = await client.get("/api/jobs/missing")
 
     assert repair.status_code == 202
     assert repair.json() == {"job_id": "repair-abc123", "status": "accepted"}
     assert retry.status_code == 202
     assert retry.json() == {"job_id": "retry-miss-7", "status": "accepted"}
+    assert job.status_code == 200
+    assert job.json()["status"] == "success"
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "job not found"}
 
 
 @pytest.mark.asyncio
@@ -218,6 +235,33 @@ async def test_settings_validation_and_runtime_reload_are_atomic() -> None:
     assert valid.json()["dry_run"] is False
     assert settings.updated == {"dry_run": False}
     assert reloads == 1
+
+
+@pytest.mark.asyncio
+async def test_settings_encryption_failure_returns_actionable_safe_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class BrokenSettings(MutableSettings):
+        async def update_public(self, patch: dict[str, Any]) -> dict[str, Any]:
+            raise SettingsEncryptionError(
+                "CROWDARRR_MASTER_KEY is malformed; secret=must-not-leak"
+            )
+
+    app = create_app(services=service_stub(settings=BrokenSettings()), api_token="")
+    caplog.set_level("ERROR")
+
+    async with client_for(app) as client:
+        response = await client.put("/api/settings", json={"dry_run": False})
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": (
+            "settings encryption is unavailable; check CROWDARRR_MASTER_KEY "
+            "and server logs"
+        )
+    }
+    assert "must-not-leak" not in response.text
+    assert "must-not-leak" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -429,16 +473,16 @@ async def test_default_application_lifecycle_creates_durable_state(
     ("status_code", "expected"),
     [
         (None, ConnectorHealth(True)),
-        (404, ConnectorHealth(True)),
+        (401, ConnectorHealth(False, detail="authentication failed")),
         (503, ConnectorHealth(False, detail="service unavailable")),
     ],
 )
-async def test_crowdnfo_health_treats_a_lookup_miss_as_reachable(
+async def test_crowdnfo_health_validates_saved_credentials(
     status_code: int | None,
     expected: ConnectorHealth,
 ) -> None:
     class Client:
-        async def lookup(self, **_: Any) -> None:
+        async def validate_api_key(self) -> None:
             if status_code is None:
                 return
             request = httpx.Request("GET", "https://crowdnfo.net/api/test")
@@ -545,6 +589,7 @@ async def test_default_dashboard_and_logs_have_stable_empty_shapes() -> None:
         },
         "recent_activity": [],
         "stuck_torrents": [],
+        "dry_run": True,
     }
     assert logs == {"items": [], "next_cursor": None}
 
@@ -563,6 +608,7 @@ async def test_default_connector_test_reports_disabled_incomplete_and_health() -
     )
 
     disabled = await services.connectors.test("qbittorrent")
+    crowdnfo_disabled = await services.connectors.test("crowdnfo")
     settings = AppSettings(
         qbittorrent=ConnectorSettings(enabled=True, base_url="http://qbittorrent:8080")
     )
@@ -579,6 +625,7 @@ async def test_default_connector_test_reports_disabled_incomplete_and_health() -
     healthy = await services.connectors.test("qbittorrent")
 
     assert disabled["status"] == "disabled"
+    assert crowdnfo_disabled["status"] == "disabled"
     assert incomplete["status"] == "unhealthy"
     assert incomplete["message"] == "connector configuration is incomplete"
     assert healthy["status"] == "healthy"

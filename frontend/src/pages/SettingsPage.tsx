@@ -324,6 +324,7 @@ function ConnectorFieldset({
   onUpdate,
   pending,
   secretValue,
+  testDisabledReason,
 }: {
   connector: ConnectorSettings;
   definition: (typeof connectorDefinitions)[number];
@@ -335,6 +336,7 @@ function ConnectorFieldset({
   ) => void;
   pending: boolean;
   secretValue?: string;
+  testDisabledReason?: string;
 }) {
   const { id, label, secretKey, secretLabel, secretType, supportsUsername } =
     definition;
@@ -355,11 +357,11 @@ function ConnectorFieldset({
         </div>
         <Button
           aria-label={`Test ${label} connection`}
-          disabled={pending}
+          disabled={pending || Boolean(testDisabledReason)}
           onClick={() => onTest(id, label)}
           type="button"
         >
-          {pending ? "Testing…" : "Test"}
+          {pending ? "Testing…" : (testDisabledReason ?? "Test")}
         </Button>
       </div>
 
@@ -486,6 +488,7 @@ export default function SettingsPage() {
   const [feedback, setFeedback] = useState<string>();
   const [pendingTest, setPendingTest] = useState<ConnectorId>();
   const [saving, setSaving] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
 
   const loadSettings = useCallback(async () => {
     setLoadError(undefined);
@@ -494,6 +497,7 @@ export default function SettingsPage() {
         normaliseSettings(await apiRequest<unknown>("/api/settings")),
       );
       setSecrets(emptySecrets);
+      setHasUnsavedChanges(false);
     } catch (error) {
       setLoadError(errorMessage(error));
     }
@@ -504,7 +508,13 @@ export default function SettingsPage() {
   }, [loadSettings]);
 
   const update = (recipe: (current: SettingsData) => SettingsData) => {
+    setHasUnsavedChanges(true);
     setSettings((current) => (current ? recipe(current) : current));
+  };
+
+  const updateSecret = (key: SecretKey, value: string) => {
+    setHasUnsavedChanges(true);
+    setSecrets((current) => ({ ...current, [key]: value }));
   };
 
   const updateConnector = (
@@ -529,6 +539,10 @@ export default function SettingsPage() {
         `/api/connectors/${id}/test`,
         { method: "POST" },
       );
+      if (response.status !== "healthy") {
+        setActionError(`${label}: ${response.message || response.status}`);
+        return;
+      }
       setFeedback(
         `${response.message}${response.latency_ms == null ? "" : ` · ${response.latency_ms} ms`}`,
       );
@@ -552,6 +566,7 @@ export default function SettingsPage() {
       });
       setSettings(normaliseSettings(response));
       setSecrets(emptySecrets);
+      setHasUnsavedChanges(false);
       setFeedback("Settings saved");
     } catch (error) {
       setActionError(errorMessage(error));
@@ -567,6 +582,19 @@ export default function SettingsPage() {
         mappingIndex === index ? { ...mapping, ...patch } : mapping,
       ),
     }));
+  };
+
+  const testDisabledReason = (
+    connector: ConnectorSettings,
+    definition: (typeof connectorDefinitions)[number],
+  ): string | undefined => {
+    if (hasUnsavedChanges) return "Save first";
+    if (!connector.enabled) return "Enable first";
+    if (!connector.url.trim()) return "URL required";
+    if (definition.secretType === "api_key" && !connector.api_key_configured) {
+      return "API key required";
+    }
+    return undefined;
   };
 
   const updateCategoryMapping = (
@@ -637,11 +665,24 @@ export default function SettingsPage() {
                   </div>
                   <Button
                     aria-label="Test CrowdNFO connection"
-                    disabled={pendingTest === "crowdnfo"}
+                    disabled={
+                      pendingTest === "crowdnfo" ||
+                      hasUnsavedChanges ||
+                      !settings.crowdnfo.api_key_configured ||
+                      !settings.crowdnfo.base_url.trim()
+                    }
                     onClick={() => void testConnector("crowdnfo", "CrowdNFO")}
                     type="button"
                   >
-                    {pendingTest === "crowdnfo" ? "Testing…" : "Test"}
+                    {pendingTest === "crowdnfo"
+                      ? "Testing…"
+                      : hasUnsavedChanges
+                        ? "Save first"
+                        : !settings.crowdnfo.api_key_configured
+                          ? "API key required"
+                          : !settings.crowdnfo.base_url.trim()
+                            ? "URL required"
+                            : "Test"}
                   </Button>
                 </div>
                 <div className="grid gap-4 sm:grid-cols-2">
@@ -667,10 +708,7 @@ export default function SettingsPage() {
                     id="crowdnfo-api-key"
                     label="CrowdNFO API key"
                     onChange={(value) =>
-                      setSecrets((current) => ({
-                        ...current,
-                        crowdnfo_api_key: value,
-                      }))
+                      updateSecret("crowdnfo_api_key", value)
                     }
                     value={secrets.crowdnfo_api_key}
                   />
@@ -682,9 +720,7 @@ export default function SettingsPage() {
                   connector={settings.connectors[definition.id]}
                   definition={definition}
                   key={definition.id}
-                  onSecretChange={(key, value) =>
-                    setSecrets((current) => ({ ...current, [key]: value }))
-                  }
+                  onSecretChange={(key, value) => updateSecret(key, value)}
                   onTest={(id, label) => void testConnector(id, label)}
                   onUpdate={updateConnector}
                   pending={pendingTest === definition.id}
@@ -693,6 +729,10 @@ export default function SettingsPage() {
                       ? secrets[definition.secretKey]
                       : undefined
                   }
+                  testDisabledReason={testDisabledReason(
+                    settings.connectors[definition.id],
+                    definition,
+                  )}
                 />
               ))}
             </div>
