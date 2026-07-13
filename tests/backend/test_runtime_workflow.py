@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from backend.runtime import CrowdarrrRuntime
 
 from backend.connectors.health import ConnectorHealth
 from backend.connectors.qbit import MissingNFO, TorrentFile, TorrentSnapshot
@@ -20,6 +19,7 @@ from backend.core.settings import (
     DownloadMode,
     PathMappingSetting,
 )
+from backend.runtime import CrowdarrrRuntime
 
 RAW_NFO = b"\xffbyte-exact\r\nrelease nfo\r\n"
 
@@ -303,9 +303,7 @@ class BatchRepairService:
     async def repair(self, candidate: MissingNFO) -> RepairResult:
         raise AssertionError(f"runtime repaired candidate individually: {candidate}")
 
-    async def repair_many(
-        self, candidates: list[MissingNFO]
-    ) -> list[RepairResult]:
+    async def repair_many(self, candidates: list[MissingNFO]) -> list[RepairResult]:
         self.batches.append(list(candidates))
         return [
             RepairResult(

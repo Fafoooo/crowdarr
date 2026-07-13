@@ -54,20 +54,45 @@ def reported_file_path(
     torrent: TorrentSnapshot,
     relative_path: str | PurePosixPath,
 ) -> PurePosixPath | None:
-    """Return qBittorrent's absolute file path without duplicating its content root.
+    """Return the file's absolute path at qBittorrent's actual storage location.
 
-    The WebUI API reports file names relative to ``save_path``. For multi-file
-    torrents, ``content_path`` already includes the torrent root directory, so
-    joining file names to it would produce a duplicate directory component.
+    ``content_path`` follows the active incomplete/final storage location and
+    already contains a multi-file torrent's common relative root. File entries
+    retain that relative root, so it must be removed before joining. Snapshots
+    without ``save_path`` are legacy/test inputs and retain the older base-path
+    interpretation for compatibility.
     """
 
     relative = PurePosixPath(relative_path)
     if relative.is_absolute() or ".." in relative.parts:
         return None
-    root = PurePosixPath(torrent.save_path or torrent.content_path)
-    if not root.is_absolute() or ".." in root.parts:
+    content_path = PurePosixPath(torrent.content_path)
+    if not content_path.is_absolute() or ".." in content_path.parts:
         return None
-    return root.joinpath(relative)
+    if not torrent.save_path:
+        return content_path.joinpath(relative)
+
+    safe_paths = [PurePosixPath(item.path) for item in torrent.files]
+    if any(path.is_absolute() or ".." in path.parts for path in safe_paths):
+        return None
+    if len(safe_paths) == 1 and relative == safe_paths[0]:
+        return content_path
+
+    directory_parts = [path.parts[:-1] for path in safe_paths]
+    common_parts = list(directory_parts[0]) if directory_parts else []
+    for parts in directory_parts[1:]:
+        shared_length = 0
+        for left, right in zip(common_parts, parts, strict=False):
+            if left != right:
+                break
+            shared_length += 1
+        common_parts = common_parts[:shared_length]
+        if not common_parts:
+            break
+    common_root = PurePosixPath(*common_parts) if common_parts else None
+    if common_root is not None and relative.is_relative_to(common_root):
+        relative = relative.relative_to(common_root)
+    return content_path.joinpath(relative)
 
 
 def find_stuck_nfos(

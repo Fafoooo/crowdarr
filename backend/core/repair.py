@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -32,6 +32,7 @@ class RepairStatus(StrEnum):
     TIMEOUT = "timeout"
     DRY_RUN = "dry_run"
     PLACED_UNVERIFIED = "placed_unverified"
+    VERIFIED_INCOMPLETE = "verified_incomplete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +80,7 @@ AtomicWriter = Callable[..., object]
 class TorrentRepairService:
     """Place one NFO, recheck its torrent, and verify byte-level acceptance."""
 
-    _SEEDING_STATES = frozenset({"uploading", "stalledup", "forcedup", "queuedup"})
+    _SEEDING_STATES = frozenset({"uploading", "stalledup", "forcedup"})
 
     def __init__(
         self,
@@ -155,6 +156,14 @@ class TorrentRepairService:
         )
 
     @classmethod
+    def _files_verified(
+        cls,
+        snapshot: TorrentSnapshot,
+        candidates: Sequence[MissingNFO],
+    ) -> bool:
+        return all(cls._file_verified(snapshot, candidate) for candidate in candidates)
+
+    @classmethod
     def _is_seeding(cls, snapshot: TorrentSnapshot | None) -> bool:
         return snapshot is not None and snapshot.state.lower() in cls._SEEDING_STATES
 
@@ -164,6 +173,7 @@ class TorrentRepairService:
             item
             for item in files
             if PurePosixPath(item.path).suffix.lower() in VIDEO_SUFFIXES
+            and item.progress >= 1
         ]
         return max(videos, key=lambda item: item.size, default=None)
 
@@ -183,18 +193,17 @@ class TorrentRepairService:
 
     async def _wait_for_recheck(
         self,
-        candidate: MissingNFO,
+        candidates: Sequence[MissingNFO],
         *,
         deadline: float,
     ) -> TorrentSnapshot | None:
+        candidate = candidates[0]
         checking_started = False
         while True:
             snapshot = await self._qbit.get_torrent(candidate.torrent_hash)
             if self._is_checking(snapshot):
                 checking_started = True
-            elif checking_started or (
-                snapshot.progress >= 1 and self._file_verified(snapshot, candidate)
-            ):
+            elif checking_started or self._files_verified(snapshot, candidates):
                 return snapshot
 
             if self._monotonic() >= deadline:
@@ -219,77 +228,150 @@ class TorrentRepairService:
             await self._sleep(self._poll_interval)
             snapshot = await self._qbit.get_torrent(candidate.torrent_hash)
 
-    async def repair(self, candidate: MissingNFO) -> RepairResult:
+    @staticmethod
+    def _validate_batch(candidates: Sequence[MissingNFO]) -> tuple[MissingNFO, ...]:
+        batch = tuple(candidates)
+        if not batch:
+            raise ValueError("at least one missing NFO is required")
+        torrent_hashes = {candidate.torrent_hash for candidate in batch}
+        torrent_names = {candidate.torrent_name for candidate in batch}
+        file_indexes = {candidate.file_index for candidate in batch}
+        if len(torrent_hashes) != 1 or len(torrent_names) != 1:
+            raise ValueError("all repair candidates must belong to one torrent")
+        if len(file_indexes) != len(batch):
+            raise ValueError("repair candidates must have unique file indexes")
+        return batch
+
+    def _target_for(self, candidate: MissingNFO) -> Path:
         target = self._path_mapper.map_path(candidate.reported_path)
         if target.suffix.lower() != ".nfo":
             raise UnsafePathError(
                 "torrent repair target must remain a lexical .nfo path"
             )
-        if self._dry_run:
-            return RepairResult(
-                status=RepairStatus.DRY_RUN,
-                target_path=target,
-                message="dry-run: no file or torrent state was changed",
-            )
+        return target
 
-        media_sha256 = await self._media_sha256(candidate)
-        payload = await self._crowdnfo.download_nfo(
-            release_name=candidate.torrent_name,
-            media_sha256=media_sha256,
-        )
-        self._write(target, payload)
+    async def repair_many(
+        self,
+        candidates: Sequence[MissingNFO],
+    ) -> list[RepairResult]:
+        """Place every missing NFO for one torrent before issuing one recheck."""
+
+        batch = self._validate_batch(candidates)
+        targets = [self._target_for(candidate) for candidate in batch]
+        if self._dry_run:
+            return [
+                RepairResult(
+                    status=RepairStatus.DRY_RUN,
+                    target_path=target,
+                    message="dry-run: no file or torrent state was changed",
+                )
+                for target in targets
+            ]
+
+        media_sha256 = await self._media_sha256(batch[0])
+        payloads = [
+            await self._crowdnfo.download_nfo(
+                release_name=candidate.torrent_name,
+                media_sha256=media_sha256,
+            )
+            for candidate in batch
+        ]
+        for target, payload in zip(targets, payloads, strict=True):
+            self._write(target, payload)
         await self._qbit.set_file_priority(
-            candidate.torrent_hash,
-            [candidate.file_index],
+            batch[0].torrent_hash,
+            [candidate.file_index for candidate in batch],
             priority=1,
         )
         if not self._auto_recheck:
-            return RepairResult(
-                status=RepairStatus.PLACED_UNVERIFIED,
-                target_path=target,
-                message="NFO placed but not verified because auto-recheck is disabled",
-            )
+            return [
+                RepairResult(
+                    status=RepairStatus.PLACED_UNVERIFIED,
+                    target_path=target,
+                    message=(
+                        "NFO placed but not verified because auto-recheck is disabled"
+                    ),
+                )
+                for target in targets
+            ]
 
-        await self._qbit.force_recheck(candidate.torrent_hash)
+        await self._qbit.force_recheck(batch[0].torrent_hash)
 
         deadline = self._monotonic() + self._recheck_timeout
-        snapshot = await self._wait_for_recheck(candidate, deadline=deadline)
+        snapshot = await self._wait_for_recheck(batch, deadline=deadline)
         if snapshot is None:
-            return RepairResult(
-                status=RepairStatus.TIMEOUT,
-                target_path=target,
-                retryable=True,
-                message="torrent recheck did not start and finish before timeout",
-            )
+            return [
+                RepairResult(
+                    status=RepairStatus.TIMEOUT,
+                    target_path=target,
+                    retryable=True,
+                    message="torrent recheck did not start and finish before timeout",
+                )
+                for target in targets
+            ]
 
-        verified = snapshot.progress >= 1 and self._file_verified(snapshot, candidate)
-        if not verified:
-            self._cleanup_mismatch(target)
-            return RepairResult(
-                status=RepairStatus.MISMATCH,
-                target_path=target,
-                retryable=True,
-                message="NFO mismatch: torrent remained below 100% after recheck",
-            )
+        verification = [self._file_verified(snapshot, candidate) for candidate in batch]
+        torrent_complete = snapshot.progress >= 1 and all(verification)
+        if not torrent_complete:
+            results: list[RepairResult] = []
+            for target, verified in zip(targets, verification, strict=True):
+                if verified:
+                    results.append(
+                        RepairResult(
+                            status=RepairStatus.VERIFIED_INCOMPLETE,
+                            target_path=target,
+                            verified=True,
+                            retryable=True,
+                            message=(
+                                "NFO verified, but other torrent data remains "
+                                "incomplete"
+                            ),
+                        )
+                    )
+                    continue
+                self._cleanup_mismatch(target)
+                results.append(
+                    RepairResult(
+                        status=RepairStatus.MISMATCH,
+                        target_path=target,
+                        retryable=True,
+                        message="NFO mismatch: file remained incomplete after recheck",
+                    )
+                )
+            return results
 
-        resumed = await self._qbit.resume(candidate.torrent_hash)
+        resumed = await self._qbit.resume(batch[0].torrent_hash)
         seeding = await self._wait_for_seeding(
-            candidate,
+            batch[0],
             initial=resumed,
-            deadline=deadline,
+            deadline=self._monotonic() + self._recheck_timeout,
         )
         if seeding is not None:
-            return RepairResult(
-                status=RepairStatus.SUCCESS,
+            return [
+                RepairResult(
+                    status=RepairStatus.SUCCESS,
+                    target_path=target,
+                    verified=True,
+                    seeding=True,
+                    message="NFO verified; torrent is seeding",
+                )
+                for target in targets
+            ]
+        return [
+            RepairResult(
+                status=RepairStatus.TIMEOUT,
                 target_path=target,
                 verified=True,
-                seeding=True,
-                message="NFO verified; torrent is seeding",
+                retryable=True,
+                message=(
+                    "torrent verified but did not enter an active seeding state "
+                    "before timeout"
+                ),
             )
-        return RepairResult(
-            status=RepairStatus.TIMEOUT,
-            target_path=target,
-            verified=True,
-            retryable=True,
-            message="torrent verified but did not enter a seeding state before timeout",
-        )
+            for target in targets
+        ]
+
+    async def repair(self, candidate: MissingNFO) -> RepairResult:
+        """Backward-compatible single-candidate repair entry point."""
+
+        return (await self.repair_many((candidate,)))[0]
