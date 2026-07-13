@@ -15,6 +15,7 @@ class CrowdNFOContract:
     """Paths and authentication header used by the current public beta API."""
 
     api_key_header: str = "X-Api-Key"
+    current_user_path: str = "/api/user/me"
     best_file_path: str = "/api/releases/{release_name}/files/best"
     file_download_path: str = "/api/files/{file_id}/download"
     file_upload_path: str = "/api/releases/{release_name}/files"

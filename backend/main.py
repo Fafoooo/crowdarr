@@ -13,7 +13,6 @@ from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
-import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -44,7 +43,7 @@ from backend.core.scheduler import CrowdarrrScheduler
 from backend.core.settings import AppSettings, DownloadMode
 from backend.crowdnfo.client import CrowdNFOClient
 from backend.db.operations import OperationsStore
-from backend.db.settings import SettingsStore
+from backend.db.settings import SettingsEncryptionError, SettingsStore
 from backend.runtime import (
     ActionQueueFull,
     AsyncHashService,
@@ -211,20 +210,16 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
 
 class _CrowdNFOHealth:
-    """Probe the verified lookup route without requiring a private health API."""
+    """Verify that the configured profile API key is accepted."""
 
     def __init__(self, client: CrowdNFOClient) -> None:
         self._client = client
 
     async def healthcheck(self) -> ConnectorHealth:
         try:
-            await self._client.lookup(release_name="crowdarrr-healthcheck")
+            await self._client.validate_api_key()
         except asyncio.CancelledError:
             raise
-        except httpx.HTTPStatusError as error:
-            if error.response.status_code == 404:
-                return ConnectorHealth(True)
-            return ConnectorHealth(False, detail=sanitized_error(error))
         except Exception as error:
             return ConnectorHealth(False, detail=sanitized_error(error))
         return ConnectorHealth(True)
@@ -301,6 +296,7 @@ class _RuntimeDashboard:
             return {
                 "connectors": [],
                 "counters": {name: counters.get(name, 0) for name in _COUNTER_NAMES},
+                "dry_run": True,
                 "recent_activity": [],
                 "stuck_torrents": [],
             }
@@ -326,6 +322,17 @@ class _RuntimeActions:
     async def retry_miss(self, miss_id: str) -> str:
         return (await self._runtime().enqueue_retry_miss(miss_id)).job_id
 
+    async def job_status(self, job_id: str) -> dict[str, Any]:
+        job = await self._services.operations.get_job(job_id)
+        return {
+            "job_id": job.job_id,
+            "kind": job.kind,
+            "status": job.status,
+            "result": job.result,
+            "created_at": job.created_at.isoformat(),
+            "updated_at": job.updated_at.isoformat(),
+        }
+
 
 class _RuntimeConnectors:
     def __init__(self, services: _DefaultServices) -> None:
@@ -333,8 +340,10 @@ class _RuntimeConnectors:
 
     async def test(self, connector: str) -> dict[str, Any]:
         settings = await self._services.settings.get()
-        enabled = connector == "crowdnfo" or bool(
-            getattr(getattr(settings, connector, None), "enabled", False)
+        enabled = (
+            bool(settings.crowdnfo.api_key.get_secret_value())
+            if connector == "crowdnfo"
+            else bool(getattr(getattr(settings, connector, None), "enabled", False))
         )
         if not enabled:
             return {
@@ -442,15 +451,18 @@ class _DefaultServices:
             ),
         )
 
-        crowdnfo: CrowdNFOClient | None
-        try:
-            crowdnfo = CrowdNFOClient(
-                base_url=str(settings.crowdnfo.base_url),
-                api_key=settings.crowdnfo.api_key,
-            )
-        except Exception as error:
-            LOGGER.warning("CrowdNFO runtime unavailable (%s)", sanitized_error(error))
-            crowdnfo = None
+        crowdnfo: CrowdNFOClient | None = None
+        crowdnfo_key = settings.crowdnfo.api_key.get_secret_value()
+        if crowdnfo_key:
+            try:
+                crowdnfo = CrowdNFOClient(
+                    base_url=str(settings.crowdnfo.base_url),
+                    api_key=crowdnfo_key,
+                )
+            except Exception as error:
+                LOGGER.warning(
+                    "CrowdNFO runtime unavailable (%s)", sanitized_error(error)
+                )
         if crowdnfo is not None:
             closeables.append(crowdnfo)
             health["crowdnfo"] = _CrowdNFOHealth(crowdnfo)
@@ -798,7 +810,7 @@ def create_app(
 
     application = FastAPI(
         title="Crowdarrr",
-        version="0.1.0",
+        version="0.1.1",
         docs_url=None,
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -843,6 +855,20 @@ def create_app(
             updated = await service_container.settings.update_public(patch)
         except (ValidationError, ValueError):
             return JSONResponse({"detail": "invalid settings"}, status_code=422)
+        except SettingsEncryptionError:
+            LOGGER.error(
+                "settings encryption unavailable; verify CROWDARRR_MASTER_KEY "
+                "and the persisted settings key"
+            )
+            return JSONResponse(
+                {
+                    "detail": (
+                        "settings encryption is unavailable; check "
+                        "CROWDARRR_MASTER_KEY and server logs"
+                    )
+                },
+                status_code=503,
+            )
         reload_runtime = getattr(service_container, "reload_runtime", None)
         if callable(reload_runtime):
             pending = reload_runtime()
@@ -861,6 +887,13 @@ def create_app(
                 headers={"Retry-After": "1"},
             )
         return {"job_id": str(job_id), "status": "accepted"}
+
+    @application.get("/api/jobs/{job_id}")
+    async def job_status(job_id: str) -> Any:
+        try:
+            return await service_container.actions.job_status(job_id)
+        except KeyError:
+            return JSONResponse({"detail": "job not found"}, status_code=404)
 
     @application.post("/api/torrents/{torrent_hash}/repair", status_code=202)
     async def repair_torrent(torrent_hash: str) -> Any:

@@ -63,11 +63,13 @@ definition as a local fallback; `docker compose pull` uses the configured image.
 ## First-run checklist
 
 1. Start in **dry-run** mode and leave contribution disabled.
-2. Add the CrowdNFO URL and API key, then use **Test**.
+2. Add the CrowdNFO URL and API key, choose **Save settings**, then use **Test**.
 3. Add one connector at a time and verify its health.
 4. Confirm every connector path maps to a path visible inside Crowdarrr.
 5. Run **Scan & Repair now** and inspect activity before enabling scheduled
    backfill or contribution.
+6. Dry-run actions are simulations. Disable **Dry run** and save settings before
+   expecting files to be written or qBittorrent to recheck.
 
 Settings are authoritative in SQLite and are managed through the UI.
 [`config.example.yaml`](config.example.yaml) documents the schema but is not
@@ -163,7 +165,17 @@ deliberately does not expose this lockout-prone control.
 Connector credentials are stored in SQLite and encrypted with a Fernet master
 key. When `CROWDARRR_MASTER_KEY` is unset, Crowdarrr creates a mode-`0600` key in
 the configuration directory. Back up that key with the database. Supplying the
-key by environment is supported for managed deployments; never commit it.
+key by environment is supported for managed deployments; never commit it. If a
+managed key is required, generate it exactly like this:
+
+```bash
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+```
+
+The result is a 44-character URL-safe base64 Fernet key. A value from
+`secrets.token_urlsafe()` is not interchangeable. Crowdarrr validates the key at
+startup and exits with an actionable error before accepting settings if it is
+malformed or cannot decrypt the existing database.
 
 ## Persistence, backup, and restore
 
@@ -226,6 +238,13 @@ network and tracker policy.
   does not alter the media to force completion.
 - **CrowdNFO match misses:** current downloads ultimately require an exact
   release name; enable scene-name/UmlautAdaptarr recovery and retry.
+- **Repair button appears to do nothing:** check the amber dashboard banner. In
+  dry-run mode the action is deliberately recorded as a simulation and neither
+  writes an NFO nor asks qBittorrent to recheck. Disable **Dry run**, save, and
+  retry when the mappings have been verified.
+- **Settings container will not start after setting a master key:** use the exact
+  output of `Fernet.generate_key()` shown above. Restore the key that belongs to
+  the database; replacing it makes already-encrypted connector secrets unreadable.
 - **Macvlan service is unreachable from the Docker host:** host-to-macvlan child
   isolation is expected. Access it from another LAN host or add a deliberate host
   macvlan shim.
@@ -242,6 +261,8 @@ Most importantly:
   caches SHA-256 data, but download lookup currently needs a release name.
 - Crowdarrr sends the profile key as `X-Api-Key`; the generated Swagger security
   description/test flow has not consistently reflected that working header.
+- Connector health validates the saved key with `GET /api/user/me`; a public 404
+  from a release lookup is not treated as proof of authentication.
 - `POST /api/releases` is an administrator operation, not the contributor upload
   endpoint suggested by older examples.
 - Current contribution routes are

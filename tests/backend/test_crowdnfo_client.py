@@ -65,6 +65,7 @@ async def test_download_nfo_uses_best_metadata_then_returns_file_bytes_unchanged
 
 def test_default_contract_contains_only_verified_current_beta_routes() -> None:
     assert DEFAULT_CONTRACT.api_key_header == "X-Api-Key"
+    assert DEFAULT_CONTRACT.current_user_path == "/api/user/me"
     assert DEFAULT_CONTRACT.best_file_path == "/api/releases/{release_name}/files/best"
     assert DEFAULT_CONTRACT.file_download_path == "/api/files/{file_id}/download"
     assert DEFAULT_CONTRACT.file_upload_path == "/api/releases/{release_name}/files"
@@ -171,5 +172,48 @@ async def test_hash_only_lookup_reports_capability_gap_without_network_request()
         )
         with pytest.raises(UnsupportedLookupError, match="hash-only"):
             await client.lookup(media_sha256="ef" * 32)
+
+    assert request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_uses_authenticated_current_user_endpoint() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"username": "crowdarrr-user"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = CrowdNFOClient(
+            base_url="https://crowdnfo.example/api/",
+            api_key="profile-api-key",
+            http_client=http_client,
+        )
+        await client.validate_api_key()
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/api/user/me"
+    assert requests[0].headers["X-Api-Key"] == "profile-api-key"
+
+
+@pytest.mark.asyncio
+async def test_validate_api_key_rejects_missing_key_without_a_request() -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, request=request)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = CrowdNFOClient(
+            base_url="https://crowdnfo.example",
+            http_client=http_client,
+        )
+        with pytest.raises(PermissionError, match="not configured"):
+            await client.validate_api_key()
 
     assert request_count == 0

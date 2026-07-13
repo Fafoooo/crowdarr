@@ -25,6 +25,10 @@ _CONNECTORS = (
 )
 
 
+class SettingsEncryptionError(RuntimeError):
+    """Raised when persisted settings cannot be encrypted or decrypted safely."""
+
+
 class SettingsStore:
     """Persist validated settings as encrypted JSON in SQLite.
 
@@ -47,7 +51,15 @@ class SettingsStore:
                 if self._master_key is not None
                 else self._local_key()
             )
-            self._cipher = Fernet(key)
+            try:
+                self._cipher = Fernet(key)
+            except (TypeError, ValueError) as error:
+                raise SettingsEncryptionError(
+                    "settings encryption key is invalid; CROWDARRR_MASTER_KEY "
+                    "must be a URL-safe base64-encoded 32-byte Fernet key. "
+                    "Generate it with cryptography.fernet.Fernet.generate_key(); "
+                    "do not use secrets.token_urlsafe()."
+                ) from error
         return self._cipher
 
     def _local_key(self) -> bytes:
@@ -80,11 +92,13 @@ class SettingsStore:
         if not value:
             return ""
         if not value.startswith("enc:"):
-            raise ValueError("settings database contains an unencrypted secret")
+            raise SettingsEncryptionError(
+                "settings database contains an unencrypted secret"
+            )
         try:
             return self._get_cipher().decrypt(value[4:].encode()).decode()
         except InvalidToken as exc:
-            raise ValueError(
+            raise SettingsEncryptionError(
                 "settings master key cannot decrypt stored secrets"
             ) from exc
 
@@ -126,6 +140,7 @@ class SettingsStore:
     async def _initialize_unlocked(self) -> None:
         if self._initialized:
             return
+        self._get_cipher()
         connection = await self._connect()
         try:
             await connection.execute("""
@@ -143,6 +158,14 @@ class SettingsStore:
                 (self._serialize(AppSettings()), datetime.now(UTC).isoformat()),
             )
             await connection.commit()
+            cursor = await connection.execute(
+                "SELECT payload FROM app_settings WHERE singleton = 1"
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row is None:
+                raise RuntimeError("settings row is missing")
+            self._deserialize(str(row[0]))
         finally:
             await connection.close()
         self._initialized = True
@@ -244,6 +267,8 @@ class SettingsStore:
                 settings.qbittorrent.password.get_secret_value()
             ),
             "sabnzbd_api_key": bool(settings.sabnzbd.api_key.get_secret_value()),
+            "radarr_api_key": bool(settings.radarr.api_key.get_secret_value()),
+            "sonarr_api_key": bool(settings.sonarr.api_key.get_secret_value()),
             "application_api_token": bool(
                 settings.application_api_token.get_secret_value()
             ),

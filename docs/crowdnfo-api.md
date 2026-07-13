@@ -9,15 +9,18 @@ before changing that module.
 
 | Purpose | Method and route | Payload |
 | --- | --- | --- |
+| Validate profile key | `GET /api/user/me` | Authenticated profile response |
 | Select best NFO | `GET /api/releases/{release_name}/files/best` | Query: `type=NFO`, `raw=false`, `fallback=false` |
 | Download bytes | `GET /api/files/{file_id}/download` | Response body is consumed as raw bytes |
 | Upload NFO/MediaInfo | `POST /api/releases/{release_name}/files` | Multipart `File` plus `FileType`, `OriginalFileName`, `Category`, optional `FileHash` |
 | Upload file list | `POST /api/releases/{release_name}/filelists` | JSON release/category/entries plus optional media hash |
 
-Path segments are percent-encoded. The base URL must be an absolute HTTP(S) URL
-without an added `/api` path. API keys are sent as `X-Api-Key`. GET requests are
-bounded, rate-limited, and retried for 429/5xx responses; uploads are not retried
-automatically because their idempotency cannot be assumed.
+Path segments are percent-encoded. The base URL must be an absolute HTTP(S)
+service root. A single trailing `/api` entered in Settings is accepted and
+canonicalized to the root, preventing `/api/api/...` ambiguity. API keys are sent
+as `X-Api-Key`. GET requests are bounded, rate-limited, and retried for 429/5xx
+responses; uploads are not retried automatically because their idempotency cannot
+be assumed.
 
 ## Byte preservation
 

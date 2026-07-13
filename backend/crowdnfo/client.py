@@ -214,6 +214,13 @@ class CrowdNFOClient:
             raw=data,
         )
 
+    async def validate_api_key(self) -> None:
+        """Validate the configured profile key against an authenticated route."""
+
+        if not self._api_key:
+            raise PermissionError("CrowdNFO API key is not configured")
+        await self._request("GET", self._contract.current_user_path)
+
     async def download_nfo(
         self,
         *,

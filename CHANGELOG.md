@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-13
+
+### Added
+
+- Expose repair job status and make the dashboard follow each requested repair
+  through to its real success or failure result.
+
+### Fixed
+
+- Validate the settings encryption key at startup, fail safely when stored secrets
+  cannot be decrypted, and document how to generate a valid Fernet key.
+- Canonicalize CrowdNFO base URLs, reject unsupported URL paths, and use the
+  authenticated profile endpoint for connector health so an unconfigured API key
+  can no longer appear connected.
+- Test connectors only with saved settings and report prerequisites such as a
+  missing API key, a disabled connector, or unsaved changes directly in the UI.
+- Make dry-run mode explicit on the dashboard and distinguish simulated scans and
+  repairs from live actions.
+
 ## [0.1.0] - 2026-07-13
 
 ### Added
@@ -39,5 +58,6 @@ All notable changes to this project are documented here. The format follows
 - YAML configuration is illustrative and is not automatically imported; the UI
   and SQLite are authoritative.
 
-[Unreleased]: https://github.com/Fafoooo/crowdarr/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Fafoooo/crowdarr/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Fafoooo/crowdarr/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Fafoooo/crowdarr/releases/tag/v0.1.0
