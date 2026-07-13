@@ -27,8 +27,8 @@ from backend.connectors.qbit import (
     find_stuck_nfos,
 )
 from backend.connectors.sab import SABCompletionEvent, SABWebhookResult
-from backend.core.contribution import ContributionItem
-from backend.core.files import atomic_write_bytes
+from backend.core.contribution import ContributionItem, ContributionResult
+from backend.core.files import WriteDisposition, WriteResult, atomic_write_bytes
 from backend.core.hashing import AsyncHashService as AsyncHashService
 from backend.core.hashing import HashResult
 from backend.core.library import LibraryMediaItem, find_missing_sidecars
@@ -765,10 +765,11 @@ class QBitCompletedPoller:
         torrent: TorrentSnapshot,
         action: str,
         *,
+        performed: bool = False,
         status: str,
         detail: str | None = None,
     ) -> None:
-        if status == "success":
+        if performed:
             increment = getattr(self._store, "increment_counter", None)
             if callable(increment):
                 counters = (
@@ -783,9 +784,24 @@ class QBitCompletedPoller:
                 message=detail or torrent.name,
                 details={
                     "status": status,
-                    "title": f"qBittorrent {action} {status}",
+                    "title": (
+                        f"qBittorrent {action} {status}"
+                        if performed or status != "info"
+                        else f"qBittorrent {action} skipped"
+                    ),
                 },
             )
+
+    @staticmethod
+    def _action_was_performed(action: str, result: object) -> bool:
+        if action == "fetch":
+            return (
+                isinstance(result, WriteResult)
+                and result.disposition is WriteDisposition.WRITTEN
+            )
+        if isinstance(result, ContributionResult):
+            return result.status == "success"
+        return result is not None
 
     async def poll_once(self) -> dict[str, SABWebhookResult]:
         results: dict[str, SABWebhookResult] = {}
@@ -817,7 +833,7 @@ class QBitCompletedPoller:
                         continue
                     actions.append(name)
                     try:
-                        await operation(torrent)
+                        operation_result = await operation(torrent)
                     except asyncio.CancelledError:
                         raise
                     except Exception as error:
@@ -834,7 +850,16 @@ class QBitCompletedPoller:
                             detail=errors[name],
                         )
                     else:
-                        await self._record_action(torrent, name, status="success")
+                        performed = self._action_was_performed(
+                            name,
+                            operation_result,
+                        )
+                        await self._record_action(
+                            torrent,
+                            name,
+                            performed=performed,
+                            status="success" if performed else "info",
+                        )
                         await self._store.mark_completed(action_key)
                 result = SABWebhookResult(
                     accepted=True,

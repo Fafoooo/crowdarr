@@ -9,6 +9,7 @@ import pytest
 import backend.runtime as runtime_module
 from backend.connectors.qbit import TorrentSnapshot
 from backend.connectors.sab import SABCompletionEvent
+from backend.core.files import WriteDisposition, WriteResult
 from backend.core.hashing import HashResult
 from backend.core.settings import (
     AppSettings,
@@ -209,7 +210,9 @@ async def test_sab_live_workflow_fetches_and_contributes_from_release_tree(
         nzo_id="nzo-1",
     )
 
-    await workflow.fetch_missing(event)
+    fetch_result = await workflow.fetch_missing(event)
+    assert isinstance(fetch_result, WriteResult)
+    assert fetch_result.disposition is WriteDisposition.WRITTEN
     assert empty_nfo.read_bytes() == downloader.payload
     assert downloader.calls == [("Movie-GROUP", "d" * 64)]
     assert await workflow.fetch_missing(event) == empty_nfo
@@ -316,17 +319,29 @@ class CompletionMemory:
 
 
 class PollLiveService:
-    def __init__(self, *, fail_contribution: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_contribution: bool = False,
+        fetch_performed: bool = True,
+        contribution_performed: bool = True,
+    ) -> None:
         self.calls: list[tuple[str, str]] = []
         self.fail_contribution = fail_contribution
+        self.fetch_performed = fetch_performed
+        self.contribution_performed = contribution_performed
 
-    async def fetch_missing(self, torrent: TorrentSnapshot) -> None:
+    async def fetch_missing(self, torrent: TorrentSnapshot) -> object:
         self.calls.append(("fetch", torrent.torrent_hash))
+        if self.fetch_performed:
+            return WriteResult(Path("release.nfo"), WriteDisposition.WRITTEN)
+        return Path("existing.nfo")
 
-    async def contribute(self, torrent: TorrentSnapshot) -> None:
+    async def contribute(self, torrent: TorrentSnapshot) -> object | None:
         self.calls.append(("contribute", torrent.torrent_hash))
         if self.fail_contribution:
             raise RuntimeError("secret=must-not-leak")
+        return object() if self.contribution_performed else None
 
 
 @pytest.mark.asyncio
@@ -388,7 +403,6 @@ async def test_qbit_completion_poller_filters_retries_and_marks_success() -> Non
     poller.start()
     await asyncio.sleep(0)
     await poller.close()
-    await poller.close()
 
     adapter = QBitLiveWorkflow(
         SABLiveWorkflow(
@@ -400,6 +414,37 @@ async def test_qbit_completion_poller_filters_retries_and_marks_success() -> Non
     )
     event = adapter._event(completed_torrent("adapted"))  # noqa: SLF001
     assert event.nzo_id == "adapted" and event.storage_path == "/data/adapted"
+
+
+@pytest.mark.asyncio
+async def test_qbit_completion_poller_does_not_count_noop_live_actions() -> None:
+    store = CompletionMemory()
+    poller = QBitCompletedPoller(
+        qbit=PollQBit([completed_torrent("noop")]),
+        live_service=PollLiveService(
+            fetch_performed=False,
+            contribution_performed=False,
+        ),
+        store=store,
+        fetch_enabled=True,
+        contribute_enabled=True,
+        poll_interval=0.01,
+    )
+
+    result = await poller.poll_once()
+
+    assert result["noop"].errors == {}
+    assert store.counters == {}
+    assert [details["status"] for _, _, details in store.activities] == [
+        "info",
+        "info",
+    ]
+    assert {
+        "qbit-completion:noop",
+        "qbit-completion:noop:fetch",
+        "qbit-completion:noop:contribute",
+    }.issubset(store.completed)
+    await poller.close()
 
 
 class QueueStore:
