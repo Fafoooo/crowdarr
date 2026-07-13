@@ -27,9 +27,7 @@ class FakeMatchProvider:
         media_sha256: str | None = None,
         release_name: str | None = None,
     ) -> Any | None:
-        self.calls.append(
-            {"media_sha256": media_sha256, "release_name": release_name}
-        )
+        self.calls.append({"media_sha256": media_sha256, "release_name": release_name})
         if media_sha256 is not None and release_name is None:
             raise UnsupportedLookupError("hash-only lookup is unavailable")
         return self.release
@@ -73,9 +71,7 @@ async def test_matcher_attempts_hash_then_logs_release_name_fallback(
 @pytest.mark.asyncio
 async def test_name_hit_must_match_canonical_or_variant_hash() -> None:
     requested_hash = "cd" * 32
-    provider = FakeMatchProvider(
-        release_lookup("ab" * 32, "bc" * 32, requested_hash)
-    )
+    provider = FakeMatchProvider(release_lookup("ab" * 32, "bc" * 32, requested_hash))
 
     result = await Matcher(provider=provider).match(
         media_sha256=requested_hash,

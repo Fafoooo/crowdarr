@@ -128,15 +128,13 @@ class SettingsStore:
             return
         connection = await self._connect()
         try:
-            await connection.execute(
-                """
+            await connection.execute("""
                 CREATE TABLE IF NOT EXISTS app_settings (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
-                """
-            )
+                """)
             await connection.execute(
                 """
                 INSERT OR IGNORE INTO app_settings(singleton, payload, updated_at)

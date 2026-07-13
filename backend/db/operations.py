@@ -81,8 +81,7 @@ class OperationsStore:
             await cursor.close()
             if journal_mode is None or str(journal_mode[0]).casefold() != "wal":
                 raise RuntimeError("SQLite WAL mode could not be enabled")
-            await connection.executescript(
-                """
+            await connection.executescript("""
                 CREATE TABLE IF NOT EXISTS activity (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_type TEXT NOT NULL,
@@ -124,8 +123,7 @@ class OperationsStore:
                 );
                 CREATE INDEX IF NOT EXISTS ix_file_hash_cache_updated_at
                     ON file_hash_cache(updated_at DESC);
-                """
-            )
+                """)
             now = _utc_now().isoformat()
             await connection.execute(
                 """

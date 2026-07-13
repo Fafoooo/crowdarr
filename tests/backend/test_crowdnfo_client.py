@@ -11,7 +11,9 @@ from backend.crowdnfo.endpoints import DEFAULT_CONTRACT
 
 
 @pytest.mark.asyncio
-async def test_download_nfo_uses_best_metadata_then_returns_file_bytes_unchanged() -> None:
+async def test_download_nfo_uses_best_metadata_then_returns_file_bytes_unchanged() -> (
+    None
+):
     release_name = "Movie 2026 # Group"
     file_id = "a62c08a0-17b1-4adc-b93f-498be50e78c6"
     raw_nfo = b"\x00\xff\xfeCP437:\x80\x81\r\nLine two\r\n"
@@ -50,28 +52,22 @@ async def test_download_nfo_uses_best_metadata_then_returns_file_bytes_unchanged
 
     metadata_request, download_request = requests
     assert metadata_request.method == "GET"
-    assert metadata_request.url.path == (
-        f"/api/releases/{release_name}/files/best"
-    )
+    assert metadata_request.url.path == (f"/api/releases/{release_name}/files/best")
     assert b"Movie%202026%20%23%20Group" in metadata_request.url.raw_path
     assert metadata_request.url.params == httpx.QueryParams(
         {"type": "NFO", "raw": "false", "fallback": "false"}
     )
     assert download_request.url.path == f"/api/files/{file_id}/download"
-    assert all(request.headers["X-Api-Key"] == "profile-api-key" for request in requests)
+    assert all(
+        request.headers["X-Api-Key"] == "profile-api-key" for request in requests
+    )
 
 
 def test_default_contract_contains_only_verified_current_beta_routes() -> None:
     assert DEFAULT_CONTRACT.api_key_header == "X-Api-Key"
-    assert (
-        DEFAULT_CONTRACT.best_file_path
-        == "/api/releases/{release_name}/files/best"
-    )
+    assert DEFAULT_CONTRACT.best_file_path == "/api/releases/{release_name}/files/best"
     assert DEFAULT_CONTRACT.file_download_path == "/api/files/{file_id}/download"
-    assert (
-        DEFAULT_CONTRACT.file_upload_path
-        == "/api/releases/{release_name}/files"
-    )
+    assert DEFAULT_CONTRACT.file_upload_path == "/api/releases/{release_name}/files"
     assert (
         DEFAULT_CONTRACT.filelist_upload_path
         == "/api/releases/{release_name}/filelists"
@@ -156,7 +152,9 @@ async def test_upload_filelist_uses_lower_camel_case_json() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hash_only_lookup_reports_capability_gap_without_network_request() -> None:
+async def test_hash_only_lookup_reports_capability_gap_without_network_request() -> (
+    None
+):
     request_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:

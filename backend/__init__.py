@@ -1,2 +1,1 @@
 """Crowdarrr backend package."""
-
