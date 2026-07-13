@@ -1,2 +1,1 @@
-"""Optional service connectors."""
-
+"""Optional external-service connectors."""
