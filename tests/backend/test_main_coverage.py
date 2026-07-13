@@ -498,7 +498,7 @@ async def test_default_application_lifecycle_creates_durable_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("CROWDARRR_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("CROWDARR_CONFIG_DIR", str(tmp_path))
     monkeypatch.setenv("TZ", "UTC")
     app = create_app(api_token="")
 
@@ -506,28 +506,39 @@ async def test_default_application_lifecycle_creates_durable_state(
         async with client_for(app) as client:
             response = await client.get("/api/health")
         assert response.status_code == 200
-        assert (tmp_path / "crowdarrr.sqlite3").is_file()
+        assert (tmp_path / "crowdarr.sqlite3").is_file()
 
     assert_security_headers(response)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status_code", "expected"),
+    ("validation_result", "status_code", "expected"),
     [
-        (None, ConnectorHealth(True)),
-        (401, ConnectorHealth(False, detail="authentication failed")),
-        (503, ConnectorHealth(False, detail="service unavailable")),
+        (True, None, ConnectorHealth(True)),
+        (
+            False,
+            None,
+            ConnectorHealth(
+                True,
+                detail="API reachable; profile key could not be verified",
+                degraded=True,
+            ),
+        ),
+        (None, 401, ConnectorHealth(False, detail="authentication failed")),
+        (None, 503, ConnectorHealth(False, detail="service unavailable")),
     ],
 )
 async def test_crowdnfo_health_validates_saved_credentials(
+    validation_result: bool | None,
     status_code: int | None,
     expected: ConnectorHealth,
 ) -> None:
     class Client:
-        async def validate_api_key(self) -> None:
+        async def validate_api_key(self) -> bool:
             if status_code is None:
-                return
+                assert validation_result is not None
+                return validation_result
             request = httpx.Request("GET", "https://crowdnfo.net/api/test")
             response = httpx.Response(status_code, request=request)
             raise httpx.HTTPStatusError("failed", request=request, response=response)
@@ -535,6 +546,34 @@ async def test_crowdnfo_health_validates_saved_credentials(
     health = await main_module._CrowdNFOHealth(cast(Any, Client())).healthcheck()
 
     assert health == expected
+
+
+@pytest.mark.asyncio
+async def test_legacy_database_and_master_key_remain_usable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    master_key = Fernet.generate_key().decode("ascii")
+    legacy_database = tmp_path / "crowdarrr.sqlite3"
+    legacy_store = SettingsStore(legacy_database, master_key=master_key)
+    await legacy_store.initialize()
+    await legacy_store.update(
+        SettingsPatch(crowdnfo={"api_key": "legacy-profile-key"})
+    )
+    await legacy_store.close()
+    monkeypatch.setenv("CROWDARR_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("CROWDARRR_MASTER_KEY", master_key)
+
+    app = create_app(api_token="")
+
+    async with app.router.lifespan_context(app):
+        async with client_for(app) as client:
+            response = await client.get("/api/settings")
+
+    assert response.status_code == 200
+    assert response.json()["secrets_configured"]["crowdnfo_api_key"] is True
+    assert legacy_database.is_file()
+    assert not (tmp_path / "crowdarr.sqlite3").exists()
 
 
 @pytest.mark.asyncio

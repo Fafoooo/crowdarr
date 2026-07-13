@@ -582,6 +582,42 @@ async def test_repair_timeout_is_retryable_and_never_touches_media(
 
 
 @pytest.mark.asyncio
+async def test_default_recheck_window_allows_large_torrent_checks_past_five_minutes(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    qbit = FakeQBit(
+        [
+            checking_snapshot(),
+            checking_snapshot(),
+            checking_snapshot(),
+            checking_snapshot(),
+            checked_snapshot(matched=True),
+        ],
+        events,
+        resumed_state=seeding_snapshot(),
+    )
+    service = TorrentRepairService(
+        crowdnfo=FakeCrowdNFO(b"exact nfo", events),
+        qbit=qbit,
+        path_mapper=FakePathMapper(tmp_path / "data"),
+        atomic_writer=RecordingWriter(events),
+        allowed_roots=[tmp_path / "data"],
+        poll_interval=100.0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert clock.value >= 400
+    assert result.status is RepairStatus.SUCCESS
+    assert result.verified is True
+    assert result.seeding is True
+
+
+@pytest.mark.asyncio
 async def test_dry_run_reports_mapped_target_without_download_write_or_qbit_mutation(
     tmp_path: Path,
 ) -> None:

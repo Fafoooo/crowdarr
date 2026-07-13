@@ -44,6 +44,7 @@ const settingsPublicView = {
   match_strategy: "hash_then_release_name",
   nfo_mismatch_policy: "keep",
   path_mappings: [{ local_root: "/data", remote_root: "/data" }],
+  recheck_timeout_seconds: 1800,
   qbittorrent: {
     base_url: "http://qbittorrent:8080/",
     enabled: true,
@@ -244,8 +245,8 @@ describe("settings", () => {
         testRequest = request;
         return jsonResponse({
           latency_ms: 12,
-          message: "Connected to CrowdNFO",
-          status: "healthy",
+          message: "API reachable; profile key could not be verified",
+          status: "degraded",
         });
       },
     });
@@ -272,7 +273,7 @@ describe("settings", () => {
     });
     expect(apiKey).toHaveValue("unsaved-key");
     expect(await screen.findByRole("status")).toHaveTextContent(
-      /connected to CrowdNFO/i,
+      /API reachable; profile key could not be verified/i,
     );
   });
 
@@ -381,6 +382,9 @@ describe("settings", () => {
     const schedule = screen.getByLabelText("Backfill schedule (cron)");
     await user.clear(schedule);
     await user.type(schedule, "30 2 * * 1");
+    const recheckTimeout = screen.getByLabelText("Recheck timeout (seconds)");
+    await user.clear(recheckTimeout);
+    await user.type(recheckTimeout, "2400");
 
     const qbittorrent = screen.getByRole("group", { name: "qBittorrent" });
     await user.click(within(qbittorrent).getByLabelText("Enable qBittorrent"));
@@ -412,6 +416,7 @@ describe("settings", () => {
         "match_strategy",
         "nfo_mismatch_policy",
         "path_mappings",
+        "recheck_timeout_seconds",
         "qbittorrent",
         "radarr",
         "sabnzbd",
@@ -439,6 +444,7 @@ describe("settings", () => {
       match_strategy: "release_name_only",
       nfo_mismatch_policy: "remove",
       path_mappings: [{ local_root: "/data", remote_root: "/downloads" }],
+      recheck_timeout_seconds: 2400,
       qbittorrent: {
         base_url: "http://qbittorrent:8080/",
         enabled: false,

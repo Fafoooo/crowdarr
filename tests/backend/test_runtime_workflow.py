@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from backend.connectors.health import ConnectorHealth
@@ -22,6 +23,16 @@ from backend.core.settings import (
 from backend.runtime import CrowdarrrRuntime
 
 RAW_NFO = b"\xffbyte-exact\r\nrelease nfo\r\n"
+
+
+def http_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://crowdnfo.test/api/releases/test/files/best")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"CrowdNFO returned {status_code}",
+        request=request,
+        response=response,
+    )
 
 
 def connector_settings(name: str, *, enabled: bool) -> ConnectorSettings:
@@ -101,12 +112,16 @@ class FakeRuntimeStore:
             "fetched": 0,
             "matches": 0,
             "misses": 0,
+            "placed": 0,
             "repaired": 0,
             "uploaded": 0,
         }
         self.activities: list[dict[str, Any]] = []
         self.misses: list[dict[str, Any]] = []
         self.jobs: dict[str, dict[str, Any]] = {}
+        self.negative_lookups: dict[str, dict[str, Any]] = {}
+        self.repair_states: dict[str, dict[str, Any]] = {}
+        self.repaired_once: set[str] = set()
 
     async def start_job(self, *, action: str, target: str | None = None) -> str:
         job_id = f"job-{len(self.jobs) + 1}"
@@ -124,8 +139,9 @@ class FakeRuntimeStore:
         *,
         status: str,
         detail: str | None = None,
+        result: object | None = None,
     ) -> None:
-        self.jobs[job_id].update(status=status, detail=detail)
+        self.jobs[job_id].update(status=status, detail=detail, result=result)
 
     async def increment_counter(self, name: str, amount: int = 1) -> None:
         self.counters[name] += amount
@@ -178,6 +194,64 @@ class FakeRuntimeStore:
 
     async def recent_activity(self, *, limit: int) -> list[dict[str, Any]]:
         return list(reversed(self.activities[-limit:]))
+
+    async def get_negative_lookup(self, release_name: str) -> dict[str, Any] | None:
+        return self.negative_lookups.get(release_name.casefold())
+
+    async def cache_negative_lookup(
+        self,
+        *,
+        release_name: str,
+        reason: str,
+        ttl_seconds: int,
+    ) -> None:
+        self.negative_lookups[release_name.casefold()] = {
+            "release_name": release_name,
+            "reason": reason,
+            "ttl_seconds": ttl_seconds,
+        }
+
+    async def put_repair_state(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        outcome: str,
+        message: str,
+        retryable: bool,
+    ) -> None:
+        self.repair_states[torrent_hash] = {
+            "release_name": release_name,
+            "outcome": outcome,
+            "message": message,
+            "retryable": retryable,
+        }
+
+    async def list_repair_states(self) -> dict[str, dict[str, Any]]:
+        return dict(self.repair_states)
+
+    async def list_repair_targets(self) -> set[str]:
+        return set()
+
+    async def record_repaired_once(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        message: str,
+    ) -> bool:
+        if torrent_hash in self.repaired_once:
+            return False
+        self.repaired_once.add(torrent_hash)
+        self.counters["repaired"] += 1
+        await self.put_repair_state(
+            torrent_hash=torrent_hash,
+            release_name=release_name,
+            outcome="fixed",
+            message=message,
+            retryable=False,
+        )
+        return True
 
 
 class FakeQBit:
@@ -449,7 +523,7 @@ async def test_scan_and_repair_preserves_bytes_and_persists_job_counters_and_mis
     crowdnfo = FakeCrowdNFO(
         {
             good.name: RAW_NFO,
-            missing.name: LookupError("release was not found"),
+            missing.name: http_error(404),
         }
     )
     data_root = tmp_path / "data"
@@ -485,6 +559,7 @@ async def test_scan_and_repair_preserves_bytes_and_persists_job_counters_and_mis
         "fetched": 1,
         "matches": 1,
         "misses": 1,
+        "placed": 1,
         "repaired": 1,
         "uploaded": 0,
     }
@@ -495,10 +570,15 @@ async def test_scan_and_repair_preserves_bytes_and_persists_job_counters_and_mis
             "source": "qbittorrent",
             "release_name": missing.name,
             "reason": "not found",
-            "retryable": True,
+            "retryable": False,
         }
     ]
     assert {activity["type"] for activity in store.activities} >= {"repair", "miss"}
+    miss_activity = next(
+        activity for activity in store.activities if activity["type"] == "miss"
+    )
+    assert missing.name in miss_activity["message"]
+    assert "not found" in miss_activity["message"]
 
 
 @pytest.mark.asyncio
@@ -540,6 +620,134 @@ async def test_per_torrent_repair_targets_only_the_requested_hash(
     assert ("list_torrents",) not in qbit.calls
     assert qbit.calls[:1] == [("get_torrent", "second")]
     assert store.counters["repaired"] == 1
+    assert outcome.result == {
+        "message": "NFO verified; torrent is seeding",
+        "outcome": "fixed",
+        "release_name": second.name,
+        "retryable": False,
+        "torrent_hash": second.torrent_hash,
+    }
+
+
+@pytest.mark.asyncio
+async def test_definitive_miss_is_cached_once_and_exposed_on_dashboard(
+    tmp_path: Path,
+) -> None:
+    missing = torrent_snapshot("missing", "Release.NotAvailable-GROUP")
+    repair = FakeRepairService({missing.torrent_hash: http_error(404)})
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=FakeQBit(
+            [missing],
+            {missing.torrent_hash: torrent_files(missing.name)},
+        ),
+        repair_service=repair,
+        negative_cache_ttl_seconds=43_200,
+    )
+
+    first = await runtime.repair_torrent(missing.torrent_hash)
+    second = await runtime.repair_torrent(missing.torrent_hash)
+    dashboard = await runtime.dashboard_snapshot()
+
+    assert first.status == "skipped"
+    assert second.status == "skipped"
+    assert len(repair.calls) == 1
+    assert store.counters["misses"] == 1
+    assert first.result == {
+        "message": "Release.NotAvailable-GROUP — not found in CrowdNFO",
+        "outcome": "not_available",
+        "release_name": missing.name,
+        "retryable": False,
+        "torrent_hash": missing.torrent_hash,
+    }
+    assert second.result == first.result
+    row = dashboard.stuck_torrents[0]
+    assert row.repair_outcome == "not_available"
+    assert row.repair_message == first.result["message"]
+    assert row.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_transient_fetch_failure_is_retryable_and_not_counted_as_a_miss(
+    tmp_path: Path,
+) -> None:
+    torrent = torrent_snapshot("transient", "Release.Transient-GROUP")
+    repair = FakeRepairService(
+        {
+            torrent.torrent_hash: httpx.ConnectError(
+                "temporary connection failure",
+                request=httpx.Request("GET", "https://crowdnfo.test/api/releases"),
+            )
+        }
+    )
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=FakeQBit(
+            [torrent],
+            {torrent.torrent_hash: torrent_files(torrent.name)},
+        ),
+        repair_service=repair,
+    )
+
+    outcome = await runtime.repair_torrent(torrent.torrent_hash)
+
+    assert outcome.status == "failed"
+    assert store.counters["misses"] == 0
+    assert store.repair_states[torrent.torrent_hash]["outcome"] == "fetch_failed"
+    assert outcome.result == {
+        "message": "Release.Transient-GROUP — connection failed; retry available",
+        "outcome": "fetch_failed",
+        "release_name": torrent.name,
+        "retryable": True,
+        "torrent_hash": torrent.torrent_hash,
+    }
+    assert torrent.name in store.activities[-1]["message"]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_reconciles_a_delayed_completed_recheck_once(
+    tmp_path: Path,
+) -> None:
+    completed = torrent_snapshot(
+        "delayed",
+        "Release.Delayed-GROUP",
+        progress=1.0,
+        state="uploading",
+        files=torrent_files("Release.Delayed-GROUP", nfo_progress=1.0),
+    )
+    store = FakeRuntimeStore()
+    await store.put_repair_state(
+        torrent_hash=completed.torrent_hash,
+        release_name=completed.name,
+        outcome="verification_pending",
+        message="recheck still running",
+        retryable=True,
+    )
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=FakeQBit(
+            [completed],
+            {completed.torrent_hash: completed.files},
+        ),
+    )
+
+    first = await runtime.dashboard_snapshot()
+    second = await runtime.dashboard_snapshot()
+
+    assert first.counters.repaired == 1
+    assert second.counters.repaired == 1
+    repaired = [
+        activity
+        for activity in store.activities
+        if activity["title"] == "Torrent repaired after delayed recheck"
+    ]
+    assert len(repaired) == 1
+    assert completed.name in repaired[0]["message"]
 
 
 @pytest.mark.asyncio
@@ -618,6 +826,7 @@ async def test_downloaded_nfos_count_as_fetches_and_matches_before_verification(
         "fetched": 2,
         "matches": 2,
         "misses": 0,
+        "placed": 2,
         "repaired": 0,
         "uploaded": 0,
     }
@@ -769,7 +978,14 @@ async def test_dashboard_snapshot_combines_health_counters_activity_and_stuck(
     stuck = torrent_snapshot("dashboard", "Release.Dashboard-GROUP")
     qbit = FakeQBit([stuck], {stuck.torrent_hash: torrent_files(stuck.name)})
     store = FakeRuntimeStore()
-    store.counters.update(fetched=4, matches=3, misses=1, repaired=2, uploaded=5)
+    store.counters.update(
+        fetched=4,
+        matches=3,
+        misses=1,
+        placed=3,
+        repaired=2,
+        uploaded=5,
+    )
     await store.record_activity(
         activity_type="repair",
         status="success",
@@ -796,6 +1012,7 @@ async def test_dashboard_snapshot_combines_health_counters_activity_and_stuck(
     assert health["qbittorrent"].status == "healthy"
     assert health["radarr"].status == "unhealthy"
     assert snapshot.counters.fetched == 4
+    assert snapshot.counters.placed == 3
     assert snapshot.counters.repaired == 2
     assert snapshot.recent_activity[0].title == "Torrent repaired"
     assert len(snapshot.stuck_torrents) == 1
@@ -857,6 +1074,7 @@ async def test_dashboard_groups_nfos_and_exposes_every_incomplete_torrent(
     assert torrents["ready"].repairable is True
     assert torrents["ready"].missing_nfo_count == 2
     assert torrents["ready"].reason == "ready"
+    assert torrents["ready"].repair_outcome == "ready"
     assert torrents["video"].repairable is False
     assert torrents["video"].missing_nfo_count == 1
     assert torrents["video"].reason == "video_incomplete"
