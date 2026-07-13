@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import stat
@@ -268,8 +269,15 @@ def cleanup_nfo(
     *,
     policy: MismatchCleanupPolicy,
     allowed_roots: Iterable[Path],
+    expected_sha256: bytes | None = None,
 ) -> bool:
-    """Apply mismatch cleanup without ever permitting a media-file deletion."""
+    """Remove only the expected regular NFO within configured media roots."""
+
+    if (
+        expected_sha256 is not None
+        and len(expected_sha256) != hashlib.sha256().digest_size
+    ):
+        raise ValueError("expected_sha256 must be a raw SHA-256 digest")
 
     roots = tuple(Path(root) for root in allowed_roots)
     target = _ensure_allowed(Path(path), roots, require_nfo=True)
@@ -282,6 +290,47 @@ def cleanup_nfo(
         _validate_nfo_entry(existing, target)
         if existing is None:
             return False
+        if expected_sha256 is not None:
+            try:
+                descriptor = os.open(
+                    target.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise UnsafePathError(
+                    f"NFO target changed during mismatch cleanup: {target}"
+                ) from exc
+            try:
+                opened = os.fstat(descriptor)
+                _validate_nfo_entry(opened, target)
+                if (opened.st_dev, opened.st_ino) != (existing.st_dev, existing.st_ino):
+                    return False
+                digest = hashlib.sha256()
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    digest.update(chunk)
+            finally:
+                os.close(descriptor)
+            if not secrets.compare_digest(digest.digest(), expected_sha256):
+                return False
+            current = _entry_stat(parent_fd, target.name)
+            _validate_nfo_entry(current, target)
+            if current is None or (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+                current.st_ctime_ns,
+            ) != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ):
+                return False
         os.unlink(target.name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         return True

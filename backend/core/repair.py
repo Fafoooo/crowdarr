@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -130,7 +131,7 @@ class TorrentRepairService:
             overwrite=True,
         )
 
-    def _cleanup_mismatch(self, target: Path) -> None:
+    def _cleanup_mismatch(self, target: Path, payload: bytes) -> None:
         if self._keep_mismatch:
             return
         if target.suffix.lower() != ".nfo":
@@ -140,9 +141,8 @@ class TorrentRepairService:
                 target,
                 policy=MismatchCleanupPolicy.REMOVE,
                 allowed_roots=self._allowed_roots,
+                expected_sha256=hashlib.sha256(payload).digest(),
             )
-        else:
-            target.unlink(missing_ok=True)
 
     @staticmethod
     def _is_checking(snapshot: TorrentSnapshot) -> bool:
@@ -314,7 +314,9 @@ class TorrentRepairService:
         torrent_complete = snapshot.progress >= 1 and all(verification)
         if not torrent_complete:
             results: list[RepairResult] = []
-            for target, verified in zip(targets, verification, strict=True):
+            for target, payload, verified in zip(
+                targets, payloads, verification, strict=True
+            ):
                 if verified:
                     results.append(
                         RepairResult(
@@ -329,7 +331,7 @@ class TorrentRepairService:
                         )
                     )
                     continue
-                self._cleanup_mismatch(target)
+                self._cleanup_mismatch(target, payload)
                 results.append(
                     RepairResult(
                         status=RepairStatus.MISMATCH,

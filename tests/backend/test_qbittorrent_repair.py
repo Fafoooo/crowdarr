@@ -223,6 +223,7 @@ def make_service(
         qbit=qbit,
         path_mapper=FakePathMapper(local_data),
         atomic_writer=writer,
+        allowed_roots=[local_data],
         poll_interval=1.0,
         recheck_timeout=recheck_timeout,
         sleep=clock.sleep,
@@ -514,6 +515,44 @@ async def test_repair_reports_mismatch_and_removes_only_downloaded_nfo(
     assert not expected_nfo.exists()
     assert media_path.read_bytes() == b"media stays intact"
     assert "resume" not in [event[0] for event in events]
+
+
+@pytest.mark.asyncio
+async def test_mismatch_cleanup_preserves_nfo_replaced_during_recheck(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    local_data = tmp_path / "data"
+    target = local_data / "cross-seeds/Release.Name/Release.Name.nfo"
+    target.parent.mkdir(parents=True)
+    replacement = b"replacement written by another process"
+
+    class ReplacingQBit(FakeQBit):
+        async def get_torrent(self, torrent_hash: str) -> TorrentSnapshot:
+            snapshot = await super().get_torrent(torrent_hash)
+            if snapshot.state == "pausedUP":
+                target.write_bytes(replacement)
+            return snapshot
+
+    clock = FakeClock()
+    service = TorrentRepairService(
+        crowdnfo=FakeCrowdNFO(b"mismatched downloaded bytes", events),
+        qbit=ReplacingQBit(
+            [checking_snapshot(), checked_snapshot(matched=False)], events
+        ),
+        path_mapper=FakePathMapper(local_data),
+        allowed_roots=[local_data],
+        poll_interval=1.0,
+        recheck_timeout=2.0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        keep_mismatch=False,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert result.status is RepairStatus.MISMATCH
+    assert target.read_bytes() == replacement
 
 
 @pytest.mark.asyncio
