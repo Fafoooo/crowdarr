@@ -168,12 +168,21 @@ class FakeSABHistory:
 
 
 class RecordingSABWebhook:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        performed_actions: tuple[str, ...] | None = None,
+    ) -> None:
         self.events: list[SABCompletionEvent] = []
+        self.performed_actions = performed_actions
 
     async def handle(self, event: SABCompletionEvent) -> SABWebhookResult:
         self.events.append(event)
-        return SABWebhookResult(accepted=True, actions=("fetch",))
+        return SABWebhookResult(
+            accepted=True,
+            actions=("fetch",),
+            performed_actions=self.performed_actions,
+        )
 
 
 @pytest.mark.asyncio
@@ -207,6 +216,53 @@ async def test_sab_runtime_verifies_history_path_and_processes_nzo_once() -> Non
     assert webhook.events == [verified]
     assert history.calls >= 1
     assert any("SABnzbd_nzo_1" in key for key in store.completed)
+
+
+@pytest.mark.asyncio
+async def test_sab_runtime_does_not_count_noop_or_persist_dry_run_completion() -> None:
+    event = SABCompletionEvent(**sab_payload())
+    history = FakeSABHistory(event)
+
+    noop_store = RecordingRuntimeStore()
+    noop_runtime = CrowdarrrRuntime(
+        settings=AppSettings(
+            download_mode=DownloadMode.NEW_ONLY,
+            dry_run=False,
+            sabnzbd=ConnectorSettings(
+                enabled=True,
+                base_url="http://sabnzbd:8080",
+            ),
+        ),
+        store=noop_store,
+        sab_webhook=RecordingSABWebhook(performed_actions=()),
+        sab_history=history,
+    )
+    noop = await noop_runtime.handle_sab_completion(event)
+
+    assert noop.status == "skipped"
+    assert noop_store.counters == {}
+    assert noop_store.activities[-1]["status"] == "info"
+    assert noop_store.completed
+
+    dry_store = RecordingRuntimeStore()
+    dry_runtime = CrowdarrrRuntime(
+        settings=AppSettings(
+            download_mode=DownloadMode.NEW_ONLY,
+            dry_run=True,
+            sabnzbd=ConnectorSettings(
+                enabled=True,
+                base_url="http://sabnzbd:8080",
+            ),
+        ),
+        store=dry_store,
+        sab_webhook=RecordingSABWebhook(performed_actions=()),
+        sab_history=history,
+    )
+    dry = await dry_runtime.handle_sab_completion(event)
+
+    assert dry.status == "dry_run"
+    assert dry_store.counters == {}
+    assert dry_store.completed == set()
 
 
 class BlockingQueuedRuntime:

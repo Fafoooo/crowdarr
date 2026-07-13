@@ -751,6 +751,40 @@ async def test_dashboard_reconciles_a_delayed_completed_recheck_once(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_does_not_claim_a_cached_miss_as_a_repair(
+    tmp_path: Path,
+) -> None:
+    completed = torrent_snapshot(
+        "not-ours",
+        "Release.Not.Ours-GROUP",
+        progress=1.0,
+        state="uploading",
+        files=torrent_files("Release.Not.Ours-GROUP", nfo_progress=1.0),
+    )
+    store = FakeRuntimeStore()
+    await store.put_repair_state(
+        torrent_hash=completed.torrent_hash,
+        release_name=completed.name,
+        outcome="not_available",
+        message="not found in CrowdNFO",
+        retryable=False,
+    )
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=FakeQBit(
+            [completed],
+            {completed.torrent_hash: completed.files},
+        ),
+    )
+
+    snapshot = await runtime.dashboard_snapshot()
+
+    assert snapshot.counters.repaired == 0
+    assert store.repair_states[completed.torrent_hash]["outcome"] == "not_available"
+
+
+@pytest.mark.asyncio
 async def test_runtime_batches_missing_nfos_and_counts_one_repaired_torrent(
     tmp_path: Path,
 ) -> None:

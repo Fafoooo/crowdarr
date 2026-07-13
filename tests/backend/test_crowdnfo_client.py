@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 
@@ -252,6 +253,43 @@ async def test_get_retries_transient_connection_errors_with_backoff() -> None:
     assert result.file_id == "file-1"
     assert request_count == 3
     assert delays == [0.25, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_crowdnfo_bounds_parallel_get_requests() -> None:
+    active = 0
+    maximum_active = 0
+    two_started = asyncio.Event()
+    release_requests = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        if active == 2:
+            two_started.set()
+        await release_requests.wait()
+        active -= 1
+        return httpx.Response(200, json={"fileId": "nfo-id"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http_client:
+        client = CrowdNFOClient(
+            base_url="https://crowdnfo.example",
+            http_client=http_client,
+            max_concurrency=2,
+            request_interval=0,
+        )
+        requests = [
+            asyncio.create_task(client.lookup(release_name=f"Release-{index}"))
+            for index in range(5)
+        ]
+        await asyncio.wait_for(two_started.wait(), timeout=1)
+        assert maximum_active == 2
+        release_requests.set()
+        await asyncio.gather(*requests)
+
+    assert maximum_active == 2
 
 
 @pytest.mark.asyncio

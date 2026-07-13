@@ -8,7 +8,7 @@ import pytest
 
 import backend.runtime as runtime_module
 from backend.connectors.qbit import TorrentSnapshot
-from backend.connectors.sab import SABCompletionEvent
+from backend.connectors.sab import SABCompletionEvent, SABLiveActionResult
 from backend.core.files import WriteDisposition, WriteResult
 from backend.core.hashing import HashResult
 from backend.core.settings import (
@@ -211,12 +211,19 @@ async def test_sab_live_workflow_fetches_and_contributes_from_release_tree(
     )
 
     fetch_result = await workflow.fetch_missing(event)
-    assert isinstance(fetch_result, WriteResult)
-    assert fetch_result.disposition is WriteDisposition.WRITTEN
+    assert isinstance(fetch_result, SABLiveActionResult)
+    assert fetch_result.performed is True
+    assert isinstance(fetch_result.value, WriteResult)
+    assert fetch_result.value.disposition is WriteDisposition.WRITTEN
     assert empty_nfo.read_bytes() == downloader.payload
     assert downloader.calls == [("Movie-GROUP", "d" * 64)]
-    assert await workflow.fetch_missing(event) == empty_nfo
-    assert await workflow.contribute(event) == "uploaded"
+    existing = await workflow.fetch_missing(event)
+    assert existing == SABLiveActionResult(performed=False, value=empty_nfo)
+    contribution_result = await workflow.contribute(event)
+    assert contribution_result == SABLiveActionResult(
+        performed=True,
+        value="uploaded",
+    )
     item, options = contribution.calls[0]
     assert item.media_path == media
     assert item.nfo_path == empty_nfo
@@ -251,8 +258,15 @@ async def test_sab_live_workflow_handles_dry_run_missing_media_and_hash_modes(
 
     media = release / "Empty.mkv"
     media.write_bytes(b"video")
-    assert await dry.fetch_missing(event) == release / "Empty.nfo"
-    assert await dry.contribute(event) is None
+    assert await dry.fetch_missing(event) == SABLiveActionResult(
+        performed=False,
+        terminal=False,
+        value=release / "Empty.nfo",
+    )
+    assert await dry.contribute(event) == SABLiveActionResult(
+        performed=False,
+        terminal=False,
+    )
 
     hash_only = live_settings(tmp_path)
     hash_only.match_strategy = "hash_only"
@@ -388,7 +402,12 @@ async def test_qbit_completion_poller_filters_retries_and_marks_success() -> Non
         ("contribute", "new"),
         ("contribute", "new"),
     ]
-    assert store.counters == {"fetched": 1, "matches": 1, "uploaded": 1}
+    assert store.counters == {
+        "fetched": 1,
+        "matches": 1,
+        "placed": 1,
+        "uploaded": 1,
+    }
     assert [event_type for event_type, _, _ in store.activities] == [
         "qbit_fetch",
         "qbit_contribute",

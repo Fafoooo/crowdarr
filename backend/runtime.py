@@ -26,7 +26,11 @@ from backend.connectors.qbit import (
     assess_nfo_repair,
     find_stuck_nfos,
 )
-from backend.connectors.sab import SABCompletionEvent, SABWebhookResult
+from backend.connectors.sab import (
+    SABCompletionEvent,
+    SABLiveActionResult,
+    SABWebhookResult,
+)
 from backend.core.contribution import ContributionItem, ContributionResult
 from backend.core.files import WriteDisposition, WriteResult, atomic_write_bytes
 from backend.core.hashing import AsyncHashService as AsyncHashService
@@ -43,7 +47,7 @@ LOGGER = logging.getLogger(__name__)
 WorkflowStatus = Literal["success", "partial", "failed", "skipped", "dry_run"]
 ConnectorStatus = Literal["healthy", "unhealthy", "degraded", "disabled", "unknown"]
 
-_COUNTER_NAMES = ("fetched", "matches", "misses", "repaired", "uploaded")
+_COUNTER_NAMES = ("fetched", "matches", "misses", "placed", "repaired", "uploaded")
 _CONNECTOR_LABELS = {
     "crowdnfo": "CrowdNFO",
     "qbittorrent": "qBittorrent",
@@ -70,6 +74,7 @@ class RuntimeStore(Protocol):
         *,
         status: str,
         detail: str | None = None,
+        result: object | None = None,
     ) -> object: ...
 
     async def increment_counter(self, name: str, amount: int = 1) -> object: ...
@@ -102,6 +107,38 @@ class RuntimeStore(Protocol):
     async def was_completed(self, key: str) -> bool: ...
 
     async def mark_completed(self, key: str) -> None: ...
+
+    async def get_negative_lookup(self, release_name: str) -> object | None: ...
+
+    async def cache_negative_lookup(
+        self,
+        *,
+        release_name: str,
+        reason: str,
+        ttl_seconds: int,
+    ) -> None: ...
+
+    async def put_repair_state(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        outcome: str,
+        message: str,
+        retryable: bool,
+    ) -> None: ...
+
+    async def list_repair_states(self) -> Mapping[str, object]: ...
+
+    async def list_repair_targets(self) -> set[str]: ...
+
+    async def record_repaired_once(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        message: str,
+    ) -> bool: ...
 
 
 class QBitRuntimeConnector(Protocol):
@@ -253,6 +290,7 @@ class DashboardCounters:
     fetched: int = 0
     matches: int = 0
     misses: int = 0
+    placed: int = 0
     repaired: int = 0
     uploaded: int = 0
 
@@ -279,6 +317,9 @@ class DashboardStuckTorrent:
     missing_nfo_count: int = 1
     repairable: bool = True
     reason: str = "ready"
+    repair_outcome: str = "ready"
+    repair_message: str | None = None
+    retryable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,10 +345,12 @@ class _RepairSummary:
     successes: int = 0
     failures: int = 0
     dry_runs: int = 0
+    unavailable: int = 0
+    result: dict[str, object] | None = None
 
     @property
     def status(self) -> WorkflowStatus:
-        if self.failures and self.successes:
+        if (self.failures or self.unavailable) and self.successes:
             return "partial"
         if self.failures:
             return "failed"
@@ -347,9 +390,20 @@ class OperationsRuntimeStore:
         *,
         status: str,
         detail: str | None = None,
+        result: object | None = None,
     ) -> object:
-        result = {"detail": detail} if detail is not None else {}
-        return await self._operations.update_job(job_id, status=status, result=result)
+        stored_result: dict[str, object]
+        if isinstance(result, Mapping):
+            stored_result = dict(result)
+        elif detail is not None:
+            stored_result = {"detail": detail}
+        else:
+            stored_result = {}
+        return await self._operations.update_job(
+            job_id,
+            status=status,
+            result=stored_result,
+        )
 
     async def increment_counter(self, name: str, amount: int = 1) -> object:
         return await self._operations.increment_counter(name, amount)
@@ -383,14 +437,14 @@ class OperationsRuntimeStore:
         miss_id = f"miss-{uuid4().hex}"
         await self._operations.record_activity(
             event_type="miss",
-            message=reason,
+            message=f"{release_name} — {reason}",
             details={
                 "miss_id": miss_id,
                 "source": source,
                 "release_name": release_name,
                 "retryable": retryable,
                 "status": "warning",
-                "title": "CrowdNFO miss",
+                "title": release_name,
             },
         )
         return miss_id
@@ -426,6 +480,58 @@ class OperationsRuntimeStore:
 
     async def mark_completed(self, key: str) -> None:
         await self._operations.mark_completed(key)
+
+    async def get_negative_lookup(self, release_name: str) -> object | None:
+        return await self._operations.get_negative_lookup(release_name)
+
+    async def cache_negative_lookup(
+        self,
+        *,
+        release_name: str,
+        reason: str,
+        ttl_seconds: int,
+    ) -> None:
+        await self._operations.cache_negative_lookup(
+            release_name=release_name,
+            reason=reason,
+            ttl_seconds=ttl_seconds,
+        )
+
+    async def put_repair_state(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        outcome: str,
+        message: str,
+        retryable: bool,
+    ) -> None:
+        await self._operations.put_repair_state(
+            torrent_hash=torrent_hash,
+            release_name=release_name,
+            outcome=outcome,
+            message=message,
+            retryable=retryable,
+        )
+
+    async def list_repair_states(self) -> Mapping[str, object]:
+        return await self._operations.list_repair_states()
+
+    async def list_repair_targets(self) -> set[str]:
+        return await self._operations.list_repair_targets()
+
+    async def record_repaired_once(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        message: str,
+    ) -> bool:
+        return await self._operations.record_repaired_once(
+            torrent_hash=torrent_hash,
+            release_name=release_name,
+            message=message,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,7 +587,7 @@ class InProcessActionQueue:
             index = len(self._workers) + 1
             worker = asyncio.create_task(
                 self._worker(),
-                name=f"crowdarrr-action-worker-{index}",
+                name=f"crowdarr-action-worker-{index}",
             )
             self._workers.add(worker)
             worker.add_done_callback(self._workers.discard)
@@ -659,15 +765,19 @@ class SABLiveWorkflow:
             raise LookupError(result.skipped_reason or "media hash unavailable")
         return result.digest
 
-    async def fetch_missing(self, event: SABCompletionEvent) -> object:
+    async def fetch_missing(self, event: SABCompletionEvent) -> SABLiveActionResult:
         _, media, nfo_path, _ = await asyncio.to_thread(self._inspect_release, event)
         if nfo_path is not None:
             nfo_size = await asyncio.to_thread(lambda: nfo_path.stat().st_size)
             if nfo_size > 0:
-                return nfo_path
+                return SABLiveActionResult(performed=False, value=nfo_path)
         target = nfo_path or media.with_suffix(".nfo")
         if self._settings.dry_run:
-            return target
+            return SABLiveActionResult(
+                performed=False,
+                terminal=False,
+                value=target,
+            )
         overwrite_empty = await asyncio.to_thread(_is_empty_file, target)
         media_sha256 = await self._media_digest(media, match_lookup=True)
         payload = await self._crowdnfo.download_nfo(
@@ -676,22 +786,26 @@ class SABLiveWorkflow:
         )
         if not payload:
             raise ValueError("downloaded nfo is empty")
-        return await asyncio.to_thread(
+        write_result = await asyncio.to_thread(
             atomic_write_bytes,
             target,
             payload,
             allowed_roots=self._allowed_roots,
             overwrite=overwrite_empty,
         )
+        return SABLiveActionResult(
+            performed=write_result.disposition is WriteDisposition.WRITTEN,
+            value=write_result,
+        )
 
-    async def contribute(self, event: SABCompletionEvent) -> object:
+    async def contribute(self, event: SABCompletionEvent) -> SABLiveActionResult:
         _, media, nfo_path, filelist = await asyncio.to_thread(
             self._inspect_release, event
         )
         if self._settings.dry_run:
-            return None
+            return SABLiveActionResult(performed=False, terminal=False)
         media_sha256 = await self._media_digest(media, match_lookup=False)
-        return await self._contribution.contribute(
+        contribution_result = await self._contribution.contribute(
             ContributionItem(
                 release_name=event.release_name,
                 media_path=media,
@@ -703,6 +817,15 @@ class SABLiveWorkflow:
             include_nfo=self._settings.contribute.nfo,
             include_mediainfo=self._settings.contribute.mediainfo,
             include_filelist=self._settings.contribute.filelist,
+        )
+        performed = (
+            contribution_result.status == "success"
+            if isinstance(contribution_result, ContributionResult)
+            else contribution_result is not None
+        )
+        return SABLiveActionResult(
+            performed=performed,
+            value=contribution_result,
         )
 
 
@@ -773,7 +896,9 @@ class QBitCompletedPoller:
             increment = getattr(self._store, "increment_counter", None)
             if callable(increment):
                 counters = (
-                    ("fetched", "matches") if action == "fetch" else ("uploaded",)
+                    ("fetched", "matches", "placed")
+                    if action == "fetch"
+                    else ("uploaded",)
                 )
                 for counter in counters:
                     await increment(counter)
@@ -781,7 +906,11 @@ class QBitCompletedPoller:
         if callable(record):
             await record(
                 event_type=f"qbit_{action}",
-                message=detail or torrent.name,
+                message=(
+                    f"{torrent.name} — {detail}"
+                    if detail
+                    else f"{torrent.name} — {action} complete"
+                ),
                 details={
                     "status": status,
                     "title": (
@@ -794,6 +923,8 @@ class QBitCompletedPoller:
 
     @staticmethod
     def _action_was_performed(action: str, result: object) -> bool:
+        if isinstance(result, SABLiveActionResult):
+            return result.performed
         if action == "fetch":
             return (
                 isinstance(result, WriteResult)
@@ -802,6 +933,12 @@ class QBitCompletedPoller:
         if isinstance(result, ContributionResult):
             return result.status == "success"
         return result is not None
+
+    @staticmethod
+    def _action_is_terminal(result: object) -> bool:
+        if isinstance(result, SABLiveActionResult):
+            return result.terminal
+        return True
 
     async def poll_once(self) -> dict[str, SABWebhookResult]:
         results: dict[str, SABWebhookResult] = {}
@@ -860,7 +997,8 @@ class QBitCompletedPoller:
                             performed=performed,
                             status="success" if performed else "info",
                         )
-                        await self._store.mark_completed(action_key)
+                        if self._action_is_terminal(operation_result):
+                            await self._store.mark_completed(action_key)
                 result = SABWebhookResult(
                     accepted=True,
                     actions=tuple(actions),
@@ -903,7 +1041,7 @@ class QBitCompletedPoller:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(
                 self._run(),
-                name="crowdarrr-qbit-completion-poller",
+                name="crowdarr-qbit-completion-poller",
             )
 
     async def close(self) -> None:
@@ -933,9 +1071,12 @@ class CrowdarrrRuntime:
         action_queue: ActionQueue | None = None,
         hash_service: HashService | None = None,
         healthcheck_timeout: float = 5.0,
+        negative_cache_ttl_seconds: int = 43_200,
     ) -> None:
         if healthcheck_timeout <= 0:
             raise ValueError("healthcheck_timeout must be positive")
+        if negative_cache_ttl_seconds < 1:
+            raise ValueError("negative_cache_ttl_seconds must be positive")
         self.settings = settings
         self._store = store
         self._qbit = qbit
@@ -948,6 +1089,7 @@ class CrowdarrrRuntime:
         self._action_queue = action_queue
         self._hash_service = hash_service
         self._healthcheck_timeout = healthcheck_timeout
+        self._negative_cache_ttl_seconds = negative_cache_ttl_seconds
 
     async def _start_job(
         self,
@@ -968,7 +1110,15 @@ class CrowdarrrRuntime:
         result: object | None = None,
         detail: str | None = None,
     ) -> WorkflowOutcome:
-        await self._store.finish_job(job_id, status=status, detail=detail)
+        if not isinstance(result, Mapping):
+            await self._store.finish_job(job_id, status=status, detail=detail)
+        else:
+            await self._store.finish_job(
+                job_id,
+                status=status,
+                detail=detail,
+                result=result,
+            )
         return WorkflowOutcome(job_id=job_id, status=status, result=result)
 
     async def _inspect_incomplete_torrents(self) -> list[_TorrentInspection]:
@@ -1030,6 +1180,73 @@ class CrowdarrrRuntime:
             return "not found"
         return sanitized_error(error)
 
+    @staticmethod
+    def _state_value(state: object, name: str, default: object = None) -> object:
+        if isinstance(state, Mapping):
+            return state.get(name, default)
+        return getattr(state, name, default)
+
+    @staticmethod
+    def _is_definitive_not_found(error: BaseException) -> bool:
+        return bool(
+            isinstance(error, httpx.HTTPStatusError)
+            and error.response.status_code == 404
+        )
+
+    @staticmethod
+    def _is_transient_fetch_failure(error: BaseException) -> bool:
+        if isinstance(
+            error,
+            (
+                ConnectionError,
+                TimeoutError,
+                httpx.RequestError,
+            ),
+        ):
+            return True
+        return bool(
+            isinstance(error, httpx.HTTPStatusError)
+            and (error.response.status_code == 429 or error.response.status_code >= 500)
+        )
+
+    @staticmethod
+    def _repair_result_payload(
+        candidate: MissingNFO,
+        *,
+        outcome: str,
+        message: str,
+        retryable: bool,
+    ) -> dict[str, object]:
+        return {
+            "message": message,
+            "outcome": outcome,
+            "release_name": candidate.torrent_name,
+            "retryable": retryable,
+            "torrent_hash": candidate.torrent_hash,
+        }
+
+    async def _put_repair_state(
+        self,
+        candidate: MissingNFO,
+        *,
+        outcome: str,
+        message: str,
+        retryable: bool,
+    ) -> dict[str, object]:
+        await self._store.put_repair_state(
+            torrent_hash=candidate.torrent_hash,
+            release_name=candidate.torrent_name,
+            outcome=outcome,
+            message=message,
+            retryable=retryable,
+        )
+        return self._repair_result_payload(
+            candidate,
+            outcome=outcome,
+            message=message,
+            retryable=retryable,
+        )
+
     async def _record_miss(
         self,
         *,
@@ -1049,8 +1266,8 @@ class CrowdarrrRuntime:
             await self._store.record_activity(
                 activity_type="miss",
                 status="warning",
-                title="CrowdNFO miss",
-                message=reason,
+                title=release_name,
+                message=f"{release_name} — {reason}",
                 miss_id=miss_id,
             )
 
@@ -1067,7 +1284,63 @@ class CrowdarrrRuntime:
             grouped.setdefault(candidate.torrent_hash, []).append(candidate)
 
         for group in grouped.values():
+            candidate = group[0]
+            cached = await self._store.get_negative_lookup(candidate.torrent_name)
+            if cached is not None:
+                reason = str(self._state_value(cached, "reason", "not found"))
+                message = f"{candidate.torrent_name} — {reason} in CrowdNFO"
+                summary.result = await self._put_repair_state(
+                    candidate,
+                    outcome="not_available",
+                    message=message,
+                    retryable=False,
+                )
+                summary.unavailable += 1
+                continue
+
             results = await self._repair_group(group)
+            errors = [result for result in results if isinstance(result, Exception)]
+            if len(errors) == len(results) and errors:
+                error = errors[0]
+                reason = self._miss_reason(error)
+                if self._is_definitive_not_found(error):
+                    await self._store.cache_negative_lookup(
+                        release_name=candidate.torrent_name,
+                        reason=reason,
+                        ttl_seconds=self._negative_cache_ttl_seconds,
+                    )
+                    await self._record_miss(
+                        source="qbittorrent",
+                        release_name=candidate.torrent_name,
+                        reason=reason,
+                        retryable=False,
+                    )
+                    message = f"{candidate.torrent_name} — not found in CrowdNFO"
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="not_available",
+                        message=message,
+                        retryable=False,
+                    )
+                    summary.unavailable += 1
+                    continue
+                if self._is_transient_fetch_failure(error):
+                    message = f"{candidate.torrent_name} — {reason}; retry available"
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="fetch_failed",
+                        message=message,
+                        retryable=True,
+                    )
+                    await self._store.record_activity(
+                        activity_type="repair",
+                        status="warning",
+                        title="Fetch failed – retry",
+                        message=message,
+                    )
+                    summary.failures += 1
+                    continue
+
             group_verified = bool(results) and all(
                 isinstance(result, RepairResult)
                 and result.status is RepairStatus.SUCCESS
@@ -1080,13 +1353,20 @@ class CrowdarrrRuntime:
                         source="qbittorrent",
                         release_name=candidate.torrent_name,
                         reason=reason,
-                        retryable=True,
+                        retryable=False,
+                    )
+                    message = f"{candidate.torrent_name} — {reason}"
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="fetch_failed",
+                        message=message,
+                        retryable=False,
                     )
                     summary.failures += 1
                     continue
 
                 if result.status is not RepairStatus.DRY_RUN:
-                    for counter in ("fetched", "matches"):
+                    for counter in ("fetched", "matches", "placed"):
                         await self._store.increment_counter(counter)
 
                 if result.status is RepairStatus.SUCCESS:
@@ -1095,31 +1375,63 @@ class CrowdarrrRuntime:
                             activity_type="repair",
                             status="success",
                             title="Torrent NFO verified",
-                            message=candidate.torrent_name,
+                            message=(
+                                f"{candidate.torrent_name} — "
+                                f"{result.message or 'NFO verified'}"
+                            ),
                         )
+                    summary.result = self._repair_result_payload(
+                        candidate,
+                        outcome="fixed",
+                        message=result.message or "NFO verified; torrent is seeding",
+                        retryable=False,
+                    )
                     summary.successes += 1
                 elif result.status is RepairStatus.PLACED_UNVERIFIED:
+                    message = result.message or "NFO placed; recheck disabled"
                     await self._store.record_activity(
                         activity_type="repair",
                         status="warning",
                         title="NFO placed; recheck disabled",
-                        message=candidate.torrent_name,
+                        message=f"{candidate.torrent_name} — {message}",
+                    )
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="placed",
+                        message=message,
+                        retryable=False,
                     )
                     summary.successes += 1
                 elif result.status is RepairStatus.VERIFIED_INCOMPLETE:
+                    message = result.message or "other torrent data remains incomplete"
                     await self._store.record_activity(
                         activity_type="repair",
                         status="warning",
                         title="NFO verified; torrent incomplete",
-                        message=result.message or candidate.torrent_name,
+                        message=f"{candidate.torrent_name} — {message}",
+                    )
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="verified_incomplete",
+                        message=message,
+                        retryable=True,
                     )
                     summary.successes += 1
                 elif result.status is RepairStatus.TIMEOUT and result.verified:
+                    message = (
+                        result.message or "seeding was not confirmed before timeout"
+                    )
                     await self._store.record_activity(
                         activity_type="repair",
                         status="warning",
                         title="NFO verified; seeding not confirmed",
-                        message=result.message or candidate.torrent_name,
+                        message=f"{candidate.torrent_name} — {message}",
+                    )
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="verification_pending",
+                        message=message,
+                        retryable=True,
                     )
                     summary.successes += 1
                 elif result.status is RepairStatus.DRY_RUN:
@@ -1127,26 +1439,52 @@ class CrowdarrrRuntime:
                         activity_type="repair",
                         status="info",
                         title="Dry-run repair",
-                        message=candidate.torrent_name,
+                        message=f"{candidate.torrent_name} — no files changed",
+                    )
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="dry_run",
+                        message="Dry-run simulation; no files changed",
+                        retryable=True,
                     )
                     summary.dry_runs += 1
                 else:
                     mismatch = result.status is RepairStatus.MISMATCH
+                    message = result.message or (
+                        "NFO mismatch" if mismatch else "verification timed out"
+                    )
                     await self._store.record_activity(
                         activity_type="repair",
                         status="error" if mismatch else "warning",
                         title="NFO mismatch" if mismatch else "Verification timed out",
-                        message=result.message or candidate.torrent_name,
+                        message=f"{candidate.torrent_name} — {message}",
+                    )
+                    summary.result = await self._put_repair_state(
+                        candidate,
+                        outcome="mismatch" if mismatch else "verification_pending",
+                        message=message,
+                        retryable=result.retryable,
                     )
                     summary.failures += 1
 
             if group_verified:
-                await self._store.increment_counter("repaired")
-                await self._store.record_activity(
-                    activity_type="repair",
-                    status="success",
-                    title="Torrent repaired",
-                    message=group[0].torrent_name,
+                message = "NFO verified; torrent is seeding"
+                if await self._store.record_repaired_once(
+                    torrent_hash=candidate.torrent_hash,
+                    release_name=candidate.torrent_name,
+                    message=message,
+                ):
+                    await self._store.record_activity(
+                        activity_type="repair",
+                        status="success",
+                        title="Torrent repaired",
+                        message=f"{candidate.torrent_name} — {message}",
+                    )
+                summary.result = self._repair_result_payload(
+                    candidate,
+                    outcome="fixed",
+                    message=message,
+                    retryable=False,
                 )
         return summary
 
@@ -1218,7 +1556,7 @@ class CrowdarrrRuntime:
                 detail="repair service unavailable",
             )
         summary = await self._process_repair_candidates(candidates)
-        return await self._finish(job_id, summary.status)
+        return await self._finish(job_id, summary.status, result=summary.result)
 
     async def repair_torrent(
         self,
@@ -1253,7 +1591,7 @@ class CrowdarrrRuntime:
         if not candidates:
             return await self._finish(job_id, "skipped", detail="no missing nfo")
         summary = await self._process_repair_candidates(candidates)
-        return await self._finish(job_id, summary.status)
+        return await self._finish(job_id, summary.status, result=summary.result)
 
     def _library_scan_enabled(self) -> bool:
         return mode_allows_trigger(
@@ -1330,7 +1668,7 @@ class CrowdarrrRuntime:
                     activity_type="library_fetch",
                     status="info",
                     title="Dry-run library fetch",
-                    message=item.release_name,
+                    message=f"{item.release_name} — no files changed",
                 )
                 continue
             try:
@@ -1357,21 +1695,30 @@ class CrowdarrrRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                await self._record_miss(
-                    source=item.source,
-                    release_name=item.release_name,
-                    reason=self._miss_reason(error),
-                    retryable=True,
-                )
+                reason = self._miss_reason(error)
+                if self._is_transient_fetch_failure(error):
+                    await self._store.record_activity(
+                        activity_type="library_fetch",
+                        status="warning",
+                        title="Library fetch failed – retry",
+                        message=f"{item.release_name} — {reason}",
+                    )
+                else:
+                    await self._record_miss(
+                        source=item.source,
+                        release_name=item.release_name,
+                        reason=reason,
+                        retryable=not self._is_definitive_not_found(error),
+                    )
                 failures += 1
                 continue
-            for counter in ("fetched", "matches"):
+            for counter in ("fetched", "matches", "placed"):
                 await self._store.increment_counter(counter)
             await self._store.record_activity(
                 activity_type="library_fetch",
                 status="success",
                 title="Library NFO fetched",
-                message=item.release_name,
+                message=f"{item.release_name} — sidecar NFO placed",
             )
             successes += 1
 
@@ -1448,6 +1795,11 @@ class CrowdarrrRuntime:
             LOGGER.info("sabnzbd unavailable during completion handling (%s)", detail)
             return await self._finish(job_id, "skipped", detail=detail)
 
+        performed_actions = set(
+            result.actions
+            if result.performed_actions is None
+            else result.performed_actions
+        )
         successes = 0
         failures = 0
         for action in result.actions:
@@ -1458,12 +1810,20 @@ class CrowdarrrRuntime:
                     activity_type=f"sab_{action}",
                     status="warning",
                     title=f"SAB {action} failed",
-                    message=action_error,
+                    message=f"{event.release_name} — {action_error}",
+                )
+                continue
+            if action not in performed_actions:
+                await self._store.record_activity(
+                    activity_type=f"sab_{action}",
+                    status="info",
+                    title=f"SAB {action} skipped",
+                    message=f"{event.release_name} — no change needed",
                 )
                 continue
             successes += 1
             if action == "fetch":
-                for counter in ("fetched", "matches"):
+                for counter in ("fetched", "matches", "placed"):
                     await self._store.increment_counter(counter)
             elif action == "contribute":
                 await self._store.increment_counter("uploaded")
@@ -1471,7 +1831,7 @@ class CrowdarrrRuntime:
                 activity_type=f"sab_{action}",
                 status="success",
                 title=f"SAB {action} complete",
-                message=event.release_name,
+                message=f"{event.release_name} — {action} complete",
             )
 
         if failures and successes:
@@ -1480,9 +1840,17 @@ class CrowdarrrRuntime:
             status = "failed"
         elif successes:
             status = "success"
+        elif self.settings.dry_run and result.actions:
+            status = "dry_run"
         else:
             status = "skipped"
-        if verified_workflow and result.accepted and not result.errors:
+        if (
+            verified_workflow
+            and result.accepted
+            and not result.errors
+            and not result.deferred_actions
+            and not self.settings.dry_run
+        ):
             await self._store.mark_completed(idempotency_key)
         return await self._finish(job_id, status, result=result)
 
@@ -1529,7 +1897,11 @@ class CrowdarrrRuntime:
             LOGGER.info("%s unavailable during healthcheck (%s)", name, detail)
             health = ConnectorHealth(False, detail=detail)
         latency = max(0, round((time.perf_counter() - started) * 1_000))
-        status: ConnectorStatus = "healthy" if health.healthy else "unhealthy"
+        status: ConnectorStatus = (
+            "degraded"
+            if health.degraded
+            else "healthy" if health.healthy else "unhealthy"
+        )
         return DashboardConnector(
             id=connector_id,
             name=name,
@@ -1561,10 +1933,87 @@ class CrowdarrrRuntime:
             miss_id=str(miss_id) if miss_id is not None else None,
         )
 
+    async def _reconcile_completed_repairs(self) -> None:
+        if self._qbit is None or not self.settings.qbittorrent.enabled:
+            return
+        states = await self._list_repair_states()
+        targets_method = getattr(self._store, "list_repair_targets", None)
+        legacy_targets = await targets_method() if callable(targets_method) else set()
+        placed_outcomes = {
+            "fixed",
+            "mismatch",
+            "placed",
+            "verification_pending",
+            "verified_incomplete",
+        }
+        targets = {
+            torrent_hash
+            for torrent_hash, state in states.items()
+            if str(self._state_value(state, "outcome", "")) in placed_outcomes
+        } | legacy_targets
+        if not targets:
+            return
+        try:
+            torrents = await self._qbit.list_torrents()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOGGER.info(
+                "qBittorrent unavailable during repair reconciliation (%s)",
+                sanitized_error(error),
+            )
+            return
+        seeding_states = {"uploading", "stalledup", "forcedup"}
+        for torrent in torrents:
+            if (
+                torrent.torrent_hash not in targets
+                or torrent.progress < 1
+                or torrent.state.casefold() not in seeding_states
+            ):
+                continue
+            files = list(torrent.files)
+            if not files:
+                try:
+                    files = await self._qbit.list_files(torrent.torrent_hash)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
+            if not any(
+                PurePosixPath(item.path).suffix.casefold() == ".nfo"
+                and item.progress >= 1
+                for item in files
+            ):
+                continue
+            message = (
+                f"{torrent.name} — qBittorrent reports 100% and seeding after "
+                "crowdarr repair"
+            )
+            if await self._store.record_repaired_once(
+                torrent_hash=torrent.torrent_hash,
+                release_name=torrent.name,
+                message=message,
+            ):
+                await self._store.record_activity(
+                    activity_type="repair",
+                    status="success",
+                    title="Torrent repaired after delayed recheck",
+                    message=message,
+                )
+
+    async def _list_repair_states(self) -> Mapping[str, object]:
+        method = getattr(self._store, "list_repair_states", None)
+        if not callable(method):
+            return {}
+        states = await method()
+        return states if isinstance(states, Mapping) else {}
+
     async def dashboard_snapshot(self) -> DashboardSnapshot:
+        await self._reconcile_completed_repairs()
         health_task = asyncio.create_task(self._health_snapshot())
         counters_task = asyncio.create_task(self._store.get_counters())
         activity_task = asyncio.create_task(self._store.recent_activity(limit=50))
+        states_task = asyncio.create_task(self._list_repair_states())
         try:
             torrent_inspections = (
                 await self._inspect_incomplete_torrents()
@@ -1577,10 +2026,11 @@ class CrowdarrrRuntime:
             detail = sanitized_error(error)
             LOGGER.info("qbittorrent unavailable during dashboard scan (%s)", detail)
             torrent_inspections = []
-        connectors, raw_counters, raw_activity = await asyncio.gather(
+        connectors, raw_counters, raw_activity, repair_states = await asyncio.gather(
             health_task,
             counters_task,
             activity_task,
+            states_task,
         )
         counters = {name: int(raw_counters.get(name, 0)) for name in _COUNTER_NAMES}
         return DashboardSnapshot(
@@ -1603,8 +2053,52 @@ class CrowdarrrRuntime:
                     ),
                     state=record.torrent.state,
                     missing_nfo_count=record.missing_nfo_count,
-                    repairable=bool(record.candidates),
+                    repairable=(
+                        bool(record.candidates)
+                        and str(
+                            self._state_value(
+                                repair_states.get(record.torrent.torrent_hash, {}),
+                                "outcome",
+                                "ready",
+                            )
+                        )
+                        != "not_available"
+                    ),
                     reason=record.reason,
+                    repair_outcome=(
+                        str(
+                            self._state_value(
+                                repair_states.get(record.torrent.torrent_hash, {}),
+                                "outcome",
+                                "ready",
+                            )
+                        )
+                        if record.candidates
+                        else "not_applicable"
+                    ),
+                    repair_message=(
+                        str(
+                            self._state_value(
+                                repair_states.get(record.torrent.torrent_hash, {}),
+                                "message",
+                                "",
+                            )
+                        )
+                        or None
+                        if record.candidates
+                        else None
+                    ),
+                    retryable=(
+                        bool(
+                            self._state_value(
+                                repair_states.get(record.torrent.torrent_hash, {}),
+                                "retryable",
+                                True,
+                            )
+                        )
+                        if record.candidates
+                        else False
+                    ),
                 )
                 for record in torrent_inspections
             ),

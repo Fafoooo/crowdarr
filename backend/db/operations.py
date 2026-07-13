@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +15,9 @@ import aiosqlite
 
 _BUSY_TIMEOUT_MS = 5_000
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
-_COUNTER_NAMES = ("fetched", "matches", "misses", "repaired", "uploaded")
+_COUNTER_NAMES = ("fetched", "matches", "misses", "placed", "repaired", "uploaded")
 _COUNTER_SEMANTICS_KEY = "counter_semantics"
-_COUNTER_SEMANTICS_VERSION = "2"
+_COUNTER_SEMANTICS_VERSION = "3"
 
 
 def _utc_now() -> datetime:
@@ -53,6 +53,23 @@ class JobRecord:
     status: str
     result: dict[str, Any]
     created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class NegativeLookupRecord:
+    release_name: str
+    reason: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RepairStateRecord:
+    torrent_hash: str
+    release_name: str
+    outcome: str
+    message: str
+    retryable: bool
     updated_at: datetime
 
 
@@ -131,6 +148,27 @@ class OperationsStore:
                 );
                 CREATE INDEX IF NOT EXISTS ix_file_hash_cache_updated_at
                     ON file_hash_cache(updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS negative_lookups (
+                    release_key TEXT PRIMARY KEY,
+                    release_name TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_negative_lookups_expires_at
+                    ON negative_lookups(expires_at);
+
+                CREATE TABLE IF NOT EXISTS repair_states (
+                    torrent_hash TEXT PRIMARY KEY,
+                    release_name TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_repair_states_updated_at
+                    ON repair_states(updated_at DESC);
                 """)
             await self._migrate_counter_semantics_unlocked(connection)
             now = _utc_now().isoformat()
@@ -209,6 +247,7 @@ class OperationsStore:
                     if title in repair_fetch_titles:
                         derived["fetched"] += 1
                         derived["matches"] += 1
+                        derived["placed"] += 1
                     if title == "torrent repaired" and status == "success":
                         derived["repaired"] += 1
                     continue
@@ -216,6 +255,7 @@ class OperationsStore:
                     if status == "success":
                         derived["fetched"] += 1
                         derived["matches"] += 1
+                        derived["placed"] += 1
                     continue
                 if (
                     event in {"sab_contribute", "qbit_contribute"}
@@ -228,7 +268,8 @@ class OperationsStore:
                 name: max(existing.get(name, 0), derived[name])
                 for name in _COUNTER_NAMES
             }
-            corrected["misses"] = derived["misses"]
+            if version is None:
+                corrected["misses"] = derived["misses"]
             await connection.executemany(
                 """
                 INSERT INTO counters(name, value) VALUES (?, ?)
@@ -515,6 +556,260 @@ class OperationsStore:
                 await connection.commit()
             finally:
                 await connection.close()
+
+    async def cache_negative_lookup(
+        self,
+        *,
+        release_name: str,
+        reason: str,
+        ttl_seconds: int,
+        now: datetime | None = None,
+    ) -> None:
+        if not release_name.strip() or not reason.strip():
+            raise ValueError("release_name and reason cannot be blank")
+        if ttl_seconds < 1:
+            raise ValueError("negative lookup TTL must be positive")
+        observed_at = now or _utc_now()
+        expires_at = observed_at + timedelta(seconds=ttl_seconds)
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                await connection.execute(
+                    """
+                    INSERT INTO negative_lookups(
+                        release_key, release_name, reason, expires_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(release_key) DO UPDATE SET
+                        release_name = excluded.release_name,
+                        reason = excluded.reason,
+                        expires_at = excluded.expires_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        release_name.casefold(),
+                        release_name,
+                        reason,
+                        expires_at.isoformat(),
+                        observed_at.isoformat(),
+                    ),
+                )
+                await connection.commit()
+            finally:
+                await connection.close()
+
+    async def get_negative_lookup(
+        self,
+        release_name: str,
+        *,
+        now: datetime | None = None,
+    ) -> NegativeLookupRecord | None:
+        observed_at = now or _utc_now()
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                cursor = await connection.execute(
+                    """
+                    SELECT release_name, reason, expires_at
+                    FROM negative_lookups WHERE release_key = ?
+                    """,
+                    (release_name.casefold(),),
+                )
+                row = await cursor.fetchone()
+                await cursor.close()
+                if (
+                    row is not None
+                    and datetime.fromisoformat(str(row[2])) <= observed_at
+                ):
+                    await connection.execute(
+                        "DELETE FROM negative_lookups WHERE release_key = ?",
+                        (release_name.casefold(),),
+                    )
+                    await connection.commit()
+                    row = None
+            finally:
+                await connection.close()
+        if row is None:
+            return None
+        return NegativeLookupRecord(
+            release_name=str(row[0]),
+            reason=str(row[1]),
+            expires_at=datetime.fromisoformat(str(row[2])),
+        )
+
+    async def put_repair_state(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        outcome: str,
+        message: str,
+        retryable: bool,
+        now: datetime | None = None,
+    ) -> None:
+        state_values = (torrent_hash, release_name, outcome, message)
+        if not all(value.strip() for value in state_values):
+            raise ValueError("repair state fields cannot be blank")
+        updated_at = now or _utc_now()
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                await connection.execute(
+                    """
+                    INSERT INTO repair_states(
+                        torrent_hash, release_name, outcome, message, retryable,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(torrent_hash) DO UPDATE SET
+                        release_name = excluded.release_name,
+                        outcome = excluded.outcome,
+                        message = excluded.message,
+                        retryable = excluded.retryable,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        torrent_hash,
+                        release_name,
+                        outcome,
+                        message,
+                        int(retryable),
+                        updated_at.isoformat(),
+                    ),
+                )
+                await connection.commit()
+            finally:
+                await connection.close()
+
+    async def list_repair_states(self) -> dict[str, RepairStateRecord]:
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                cursor = await connection.execute("""
+                    SELECT torrent_hash, release_name, outcome, message, retryable,
+                           updated_at
+                    FROM repair_states
+                    """)
+                rows = await cursor.fetchall()
+                await cursor.close()
+            finally:
+                await connection.close()
+        return {
+            str(row[0]): RepairStateRecord(
+                torrent_hash=str(row[0]),
+                release_name=str(row[1]),
+                outcome=str(row[2]),
+                message=str(row[3]),
+                retryable=bool(row[4]),
+                updated_at=datetime.fromisoformat(str(row[5])),
+            )
+            for row in rows
+        }
+
+    async def list_repair_targets(self) -> set[str]:
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                jobs_cursor = await connection.execute("""
+                    SELECT job_id FROM jobs
+                    WHERE kind = 'repair_torrent'
+                      AND status IN ('success', 'partial')
+                    """)
+                successful_jobs = {str(row[0]) for row in await jobs_cursor.fetchall()}
+                await jobs_cursor.close()
+                cursor = await connection.execute(
+                    "SELECT details FROM activity WHERE event_type = 'job_started'"
+                )
+                rows = await cursor.fetchall()
+                await cursor.close()
+            finally:
+                await connection.close()
+        targets: set[str] = set()
+        for row in rows:
+            try:
+                details = _load_json(str(row[0]))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            target = details.get("target")
+            job_id = details.get("job_id")
+            if (
+                isinstance(target, str)
+                and target
+                and isinstance(job_id, str)
+                and job_id in successful_jobs
+            ):
+                targets.add(target)
+        return targets
+
+    async def record_repaired_once(
+        self,
+        *,
+        torrent_hash: str,
+        release_name: str,
+        message: str,
+        now: datetime | None = None,
+    ) -> bool:
+        updated_at = now or _utc_now()
+        idempotency_key = f"repaired:{torrent_hash}"
+        async with self._lock:
+            await self._initialize_unlocked()
+            connection = await self._connect()
+            try:
+                await connection.execute("BEGIN IMMEDIATE")
+                cursor = await connection.execute(
+                    """
+                    SELECT 1 FROM completed_operations WHERE idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                )
+                completed = await cursor.fetchone()
+                await cursor.close()
+                state_cursor = await connection.execute(
+                    "SELECT outcome FROM repair_states WHERE torrent_hash = ?",
+                    (torrent_hash,),
+                )
+                state = await state_cursor.fetchone()
+                await state_cursor.close()
+                already_repaired = completed is not None or (
+                    state is not None and str(state[0]) == "fixed"
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO repair_states(
+                        torrent_hash, release_name, outcome, message, retryable,
+                        updated_at
+                    ) VALUES (?, ?, 'fixed', ?, 0, ?)
+                    ON CONFLICT(torrent_hash) DO UPDATE SET
+                        release_name = excluded.release_name,
+                        outcome = 'fixed',
+                        message = excluded.message,
+                        retryable = 0,
+                        updated_at = excluded.updated_at
+                    """,
+                    (torrent_hash, release_name, message, updated_at.isoformat()),
+                )
+                await connection.execute(
+                    """
+                    INSERT OR IGNORE INTO completed_operations(
+                        idempotency_key, completed_at
+                    ) VALUES (?, ?)
+                    """,
+                    (idempotency_key, updated_at.isoformat()),
+                )
+                if already_repaired:
+                    await connection.commit()
+                    return False
+                await connection.execute("""
+                    INSERT INTO counters(name, value) VALUES ('repaired', 1)
+                    ON CONFLICT(name) DO UPDATE SET value = value + 1
+                    """)
+                await connection.commit()
+            finally:
+                await connection.close()
+        return True
 
     async def get_file_hash(
         self,

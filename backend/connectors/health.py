@@ -21,6 +21,7 @@ class ConnectorHealth:
     healthy: bool
     version: str | None = None
     detail: str | None = None
+    degraded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
