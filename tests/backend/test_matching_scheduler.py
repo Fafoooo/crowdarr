@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -252,3 +253,44 @@ async def test_activity_counters_and_job_state_survive_restart(tmp_path: Path) -
     assert job.kind == "scan_repair"
     assert job.status == "completed"
     assert job.result == {"repaired": 1, "misses": 1}
+
+
+@pytest.mark.asyncio
+async def test_legacy_counter_migration_separates_matches_from_verification_failures(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-operations.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL CHECK (value >= 0)
+            );
+            INSERT INTO counters(name, value) VALUES ('misses', 2);
+            INSERT INTO activity(event_type, message, details, created_at)
+            VALUES
+                ('miss', 'verification timed out',
+                 '{"status":"warning","title":"CrowdNFO miss"}',
+                 '2026-07-13T08:00:00+00:00'),
+                ('miss', 'not found',
+                 '{"status":"warning","title":"CrowdNFO miss"}',
+                 '2026-07-13T08:01:00+00:00');
+            """)
+
+    store = OperationsStore(database)
+    await store.initialize()
+    counters = await store.get_counters()
+    await store.close()
+
+    assert counters["fetched"] == 1
+    assert counters["matches"] == 1
+    assert counters["misses"] == 1
+    assert counters["repaired"] == 0
+    assert counters["uploaded"] == 0

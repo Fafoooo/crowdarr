@@ -23,11 +23,12 @@ from backend.connectors.qbit import (
     MissingNFO,
     TorrentFile,
     TorrentSnapshot,
+    assess_nfo_repair,
     find_stuck_nfos,
 )
 from backend.connectors.sab import SABCompletionEvent, SABWebhookResult
-from backend.core.contribution import ContributionItem
-from backend.core.files import atomic_write_bytes
+from backend.core.contribution import ContributionItem, ContributionResult
+from backend.core.files import WriteDisposition, WriteResult, atomic_write_bytes
 from backend.core.hashing import AsyncHashService as AsyncHashService
 from backend.core.hashing import HashResult
 from backend.core.library import LibraryMediaItem, find_missing_sidecars
@@ -274,6 +275,10 @@ class DashboardStuckTorrent:
     category: str
     progress: float
     missing_nfo_path: str
+    state: str = "unknown"
+    missing_nfo_count: int = 1
+    repairable: bool = True
+    reason: str = "ready"
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,9 +291,12 @@ class DashboardSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class _StuckRecord:
+class _TorrentInspection:
     torrent: TorrentSnapshot
-    candidate: MissingNFO
+    candidates: tuple[MissingNFO, ...]
+    missing_nfo_paths: tuple[PurePosixPath, ...]
+    missing_nfo_count: int
+    reason: str
 
 
 @dataclass(slots=True)
@@ -748,6 +756,53 @@ class QBitCompletedPoller:
     def _key(torrent: TorrentSnapshot) -> str:
         return f"qbit-completion:{torrent.torrent_hash}"
 
+    @classmethod
+    def _action_key(cls, torrent: TorrentSnapshot, action: str) -> str:
+        return f"{cls._key(torrent)}:{action}"
+
+    async def _record_action(
+        self,
+        torrent: TorrentSnapshot,
+        action: str,
+        *,
+        performed: bool = False,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        if performed:
+            increment = getattr(self._store, "increment_counter", None)
+            if callable(increment):
+                counters = (
+                    ("fetched", "matches") if action == "fetch" else ("uploaded",)
+                )
+                for counter in counters:
+                    await increment(counter)
+        record = getattr(self._store, "record_activity", None)
+        if callable(record):
+            await record(
+                event_type=f"qbit_{action}",
+                message=detail or torrent.name,
+                details={
+                    "status": status,
+                    "title": (
+                        f"qBittorrent {action} {status}"
+                        if performed or status != "info"
+                        else f"qBittorrent {action} skipped"
+                    ),
+                },
+            )
+
+    @staticmethod
+    def _action_was_performed(action: str, result: object) -> bool:
+        if action == "fetch":
+            return (
+                isinstance(result, WriteResult)
+                and result.disposition is WriteDisposition.WRITTEN
+            )
+        if isinstance(result, ContributionResult):
+            return result.status == "success"
+        return result is not None
+
     async def poll_once(self) -> dict[str, SABWebhookResult]:
         results: dict[str, SABWebhookResult] = {}
         async with self._poll_lock:
@@ -773,9 +828,12 @@ class QBitCompletedPoller:
                 for name, enabled, operation in operations:
                     if not enabled:
                         continue
+                    action_key = self._action_key(torrent, name)
+                    if await self._store.was_completed(action_key):
+                        continue
                     actions.append(name)
                     try:
-                        await operation(torrent)
+                        operation_result = await operation(torrent)
                     except asyncio.CancelledError:
                         raise
                     except Exception as error:
@@ -785,13 +843,46 @@ class QBitCompletedPoller:
                             name,
                             errors[name],
                         )
+                        await self._record_action(
+                            torrent,
+                            name,
+                            status="warning",
+                            detail=errors[name],
+                        )
+                    else:
+                        performed = self._action_was_performed(
+                            name,
+                            operation_result,
+                        )
+                        await self._record_action(
+                            torrent,
+                            name,
+                            performed=performed,
+                            status="success" if performed else "info",
+                        )
+                        await self._store.mark_completed(action_key)
                 result = SABWebhookResult(
                     accepted=True,
                     actions=tuple(actions),
                     errors=errors,
                 )
                 results[torrent.torrent_hash] = result
-                if actions and not errors:
+                enabled_actions = tuple(
+                    name
+                    for name, enabled in (
+                        ("fetch", self._fetch_enabled),
+                        ("contribute", self._contribute_enabled),
+                    )
+                    if enabled
+                )
+                all_completed = bool(enabled_actions)
+                for name in enabled_actions:
+                    if not await self._store.was_completed(
+                        self._action_key(torrent, name)
+                    ):
+                        all_completed = False
+                        break
+                if all_completed:
                     await self._store.mark_completed(key)
         return results
 
@@ -880,24 +971,53 @@ class CrowdarrrRuntime:
         await self._store.finish_job(job_id, status=status, detail=detail)
         return WorkflowOutcome(job_id=job_id, status=status, result=result)
 
-    async def _discover_stuck_records(self) -> list[_StuckRecord]:
+    async def _inspect_incomplete_torrents(self) -> list[_TorrentInspection]:
         if self._qbit is None:
             return []
-        records: list[_StuckRecord] = []
+        records: list[_TorrentInspection] = []
         torrents = await self._qbit.list_torrents()
         for torrent in torrents:
             if torrent.progress >= 1:
                 continue
-            files = await self._qbit.list_files(torrent.torrent_hash)
+            try:
+                files = await self._qbit.list_files(torrent.torrent_hash)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOGGER.info(
+                    "qBittorrent file list unavailable for %s (%s)",
+                    torrent.torrent_hash,
+                    sanitized_error(error),
+                )
+                records.append(
+                    _TorrentInspection(
+                        torrent=torrent,
+                        candidates=(),
+                        missing_nfo_paths=(),
+                        missing_nfo_count=0,
+                        reason="inspection_failed",
+                    )
+                )
+                continue
             hydrated = replace(torrent, files=files)
-            records.extend(
-                _StuckRecord(torrent=hydrated, candidate=candidate)
-                for candidate in find_stuck_nfos(hydrated)
+            assessment = assess_nfo_repair(hydrated)
+            records.append(
+                _TorrentInspection(
+                    torrent=hydrated,
+                    candidates=assessment.candidates,
+                    missing_nfo_paths=assessment.reported_nfo_paths,
+                    missing_nfo_count=assessment.incomplete_nfo_count,
+                    reason=assessment.status,
+                )
             )
         return records
 
     async def discover_stuck_torrents(self) -> list[MissingNFO]:
-        return [record.candidate for record in await self._discover_stuck_records()]
+        return [
+            candidate
+            for record in await self._inspect_incomplete_torrents()
+            for candidate in record.candidates
+        ]
 
     @staticmethod
     def _miss_reason(error: BaseException) -> str:
@@ -965,9 +1085,11 @@ class CrowdarrrRuntime:
                     summary.failures += 1
                     continue
 
-                if result.status is RepairStatus.SUCCESS:
+                if result.status is not RepairStatus.DRY_RUN:
                     for counter in ("fetched", "matches"):
                         await self._store.increment_counter(counter)
+
+                if result.status is RepairStatus.SUCCESS:
                     if not group_verified:
                         await self._store.record_activity(
                             activity_type="repair",
@@ -977,8 +1099,6 @@ class CrowdarrrRuntime:
                         )
                     summary.successes += 1
                 elif result.status is RepairStatus.PLACED_UNVERIFIED:
-                    for counter in ("fetched", "matches"):
-                        await self._store.increment_counter(counter)
                     await self._store.record_activity(
                         activity_type="repair",
                         status="warning",
@@ -987,8 +1107,6 @@ class CrowdarrrRuntime:
                     )
                     summary.successes += 1
                 elif result.status is RepairStatus.VERIFIED_INCOMPLETE:
-                    for counter in ("fetched", "matches"):
-                        await self._store.increment_counter(counter)
                     await self._store.record_activity(
                         activity_type="repair",
                         status="warning",
@@ -997,8 +1115,6 @@ class CrowdarrrRuntime:
                     )
                     summary.successes += 1
                 elif result.status is RepairStatus.TIMEOUT and result.verified:
-                    for counter in ("fetched", "matches"):
-                        await self._store.increment_counter(counter)
                     await self._store.record_activity(
                         activity_type="repair",
                         status="warning",
@@ -1015,15 +1131,12 @@ class CrowdarrrRuntime:
                     )
                     summary.dry_runs += 1
                 else:
-                    await self._record_miss(
-                        source="qbittorrent",
-                        release_name=candidate.torrent_name,
-                        reason=(
-                            "nfo mismatch"
-                            if result.status is RepairStatus.MISMATCH
-                            else "verification timed out"
-                        ),
-                        retryable=result.retryable,
+                    mismatch = result.status is RepairStatus.MISMATCH
+                    await self._store.record_activity(
+                        activity_type="repair",
+                        status="error" if mismatch else "warning",
+                        title="NFO mismatch" if mismatch else "Verification timed out",
+                        message=result.message or candidate.torrent_name,
                     )
                     summary.failures += 1
 
@@ -1453,8 +1566,8 @@ class CrowdarrrRuntime:
         counters_task = asyncio.create_task(self._store.get_counters())
         activity_task = asyncio.create_task(self._store.recent_activity(limit=50))
         try:
-            stuck_records = (
-                await self._discover_stuck_records()
+            torrent_inspections = (
+                await self._inspect_incomplete_torrents()
                 if self.settings.qbittorrent.enabled and self._qbit is not None
                 else []
             )
@@ -1463,7 +1576,7 @@ class CrowdarrrRuntime:
         except Exception as error:
             detail = sanitized_error(error)
             LOGGER.info("qbittorrent unavailable during dashboard scan (%s)", detail)
-            stuck_records = []
+            torrent_inspections = []
         connectors, raw_counters, raw_activity = await asyncio.gather(
             health_task,
             counters_task,
@@ -1483,9 +1596,17 @@ class CrowdarrrRuntime:
                     name=record.torrent.name,
                     category=record.torrent.category,
                     progress=record.torrent.progress,
-                    missing_nfo_path=str(record.candidate.reported_path),
+                    missing_nfo_path=(
+                        str(record.missing_nfo_paths[0])
+                        if record.missing_nfo_paths
+                        else ""
+                    ),
+                    state=record.torrent.state,
+                    missing_nfo_count=record.missing_nfo_count,
+                    repairable=bool(record.candidates),
+                    reason=record.reason,
                 )
-                for record in stuck_records
+                for record in torrent_inspections
             ),
         )
 

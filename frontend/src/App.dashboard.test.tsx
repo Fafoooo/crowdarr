@@ -125,11 +125,11 @@ describe("dashboard", () => {
 
     const metrics = screen.getByRole("region", { name: /lifetime counters/i });
     for (const [label, value] of [
-      ["Fetched", "37"],
+      ["NFOs fetched", "37"],
       ["Torrents repaired", "9"],
-      ["Uploaded", "14"],
-      ["Matches", "51"],
-      ["Misses", "4"],
+      ["Uploads completed", "14"],
+      ["CrowdNFO matches", "51"],
+      ["CrowdNFO misses", "4"],
     ]) {
       const metric = within(metrics).getByRole("group", { name: label });
       expect(within(metric).getByText(value)).toBeVisible();
@@ -142,7 +142,9 @@ describe("dashboard", () => {
     expect(within(activity).getByText(/recheck reached 100%/i)).toBeVisible();
     expect(within(activity).getByText(/retry scheduled/i)).toBeVisible();
 
-    const stuck = screen.getByRole("region", { name: /stuck torrents/i });
+    const stuck = screen.getByRole("region", {
+      name: /incomplete qBittorrent torrents/i,
+    });
     const torrentRow = within(stuck).getByRole("row", {
       name: /Sample\.Release-GROUP/i,
     });
@@ -153,6 +155,80 @@ describe("dashboard", () => {
         name: /repair Sample\.Release-GROUP/i,
       }),
     ).toBeEnabled();
+  });
+
+  it("shows every incomplete qBittorrent torrent and only repairs ready NFO cases", async () => {
+    installFetchMock({
+      "GET /api/dashboard": jsonResponse({
+        ...dashboardResponse,
+        stuck_torrents: [
+          {
+            category: "cross-seed-link",
+            hash: "ready",
+            missing_nfo_count: 2,
+            missing_nfo_path: "/data/Ready/release.nfo",
+            name: "Ready.Release-GROUP",
+            progress: 0.999,
+            reason: "ready",
+            repairable: true,
+            state: "stalledDL",
+          },
+          {
+            category: "cross-seed-link",
+            hash: "video",
+            missing_nfo_count: 1,
+            missing_nfo_path: "/data/Video/release.nfo",
+            name: "Video.Incomplete-GROUP",
+            progress: 0.75,
+            reason: "video_incomplete",
+            repairable: false,
+            state: "stoppedDL",
+          },
+          {
+            category: "radarr",
+            hash: "no-nfo",
+            missing_nfo_count: 0,
+            missing_nfo_path: "",
+            name: "No.Incomplete.NFO-GROUP",
+            progress: 0.98,
+            reason: "no_incomplete_nfo",
+            repairable: false,
+            state: "stalledDL",
+          },
+        ],
+      }),
+    });
+
+    render(<App />);
+
+    const torrents = await screen.findByRole("region", {
+      name: /incomplete qBittorrent torrents/i,
+    });
+    expect(
+      within(torrents).getByText(/1 repairable.*3 incomplete/i),
+    ).toBeVisible();
+    expect(within(torrents).getByText("2 NFO files")).toBeVisible();
+    expect(
+      within(torrents).getByText(/video data is below 99%/i),
+    ).toBeVisible();
+    expect(
+      within(torrents).getByText(/no incomplete NFO detected/i),
+    ).toBeVisible();
+    expect(
+      within(torrents).getByRole("button", {
+        name: /repair Ready\.Release-GROUP/i,
+      }),
+    ).toBeEnabled();
+    expect(
+      within(torrents).queryByRole("button", {
+        name: /repair Video\.Incomplete-GROUP/i,
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(torrents).queryByRole("button", {
+        name: /repair No\.Incomplete\.NFO-GROUP/i,
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("queues a scan and an individual torrent repair from semantic actions", async () => {

@@ -40,7 +40,7 @@ from backend.core.mediainfo import MediaInfoRunner
 from backend.core.repair import TorrentRepairService
 from backend.core.scan import ScanTrigger, mode_allows_trigger
 from backend.core.scheduler import CrowdarrrScheduler
-from backend.core.settings import AppSettings, DownloadMode
+from backend.core.settings import AppSettings, DownloadMode, SettingsPatch
 from backend.crowdnfo.client import CrowdNFOClient
 from backend.db.operations import OperationsStore
 from backend.db.settings import SettingsEncryptionError, SettingsStore
@@ -338,43 +338,58 @@ class _RuntimeConnectors:
     def __init__(self, services: _DefaultServices) -> None:
         self._services = services
 
-    async def test(self, connector: str) -> dict[str, Any]:
+    async def test(
+        self,
+        connector: str,
+        patch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         settings = await self._services.settings.get()
-        enabled = (
-            bool(settings.crowdnfo.api_key.get_secret_value())
-            if connector == "crowdnfo"
-            else bool(getattr(getattr(settings, connector, None), "enabled", False))
-        )
-        if not enabled:
+        temporary_bundle: _RuntimeBundle | None = None
+        try:
+            if patch is not None:
+                settings = SettingsStore.apply_patch(
+                    settings,
+                    SettingsPatch.model_validate({connector: patch}),
+                )
+                temporary_bundle = self._services._compose_bundle(settings)
+            enabled = (
+                bool(settings.crowdnfo.api_key.get_secret_value())
+                if connector == "crowdnfo"
+                else bool(getattr(getattr(settings, connector, None), "enabled", False))
+            )
+            if not enabled:
+                return {
+                    "connector": connector,
+                    "status": "disabled",
+                    "latency_ms": None,
+                    "message": "connector is disabled",
+                }
+            bundle = temporary_bundle or self._services.bundle
+            health_connector = (
+                bundle.health_connectors.get(connector) if bundle is not None else None
+            )
+            if health_connector is None:
+                return {
+                    "connector": connector,
+                    "status": "unhealthy",
+                    "latency_ms": None,
+                    "message": "connector configuration is incomplete",
+                }
+            started = asyncio.get_running_loop().time()
+            health = await health_connector.healthcheck()
+            latency = max(
+                0,
+                round((asyncio.get_running_loop().time() - started) * 1_000),
+            )
             return {
                 "connector": connector,
-                "status": "disabled",
-                "latency_ms": None,
-                "message": "connector is disabled",
+                "status": "healthy" if health.healthy else "unhealthy",
+                "latency_ms": latency,
+                "message": health.detail or health.version or "healthy",
             }
-        bundle = self._services.bundle
-        health_connector = (
-            bundle.health_connectors.get(connector) if bundle is not None else None
-        )
-        if health_connector is None:
-            return {
-                "connector": connector,
-                "status": "unhealthy",
-                "latency_ms": None,
-                "message": "connector configuration is incomplete",
-            }
-        started = asyncio.get_running_loop().time()
-        health = await health_connector.healthcheck()
-        latency = max(
-            0,
-            round((asyncio.get_running_loop().time() - started) * 1_000),
-        )
-        return {
-            "connector": connector,
-            "status": "healthy" if health.healthy else "unhealthy",
-            "latency_ms": latency,
-            "message": health.detail or health.version or "healthy",
-        }
+        finally:
+            if temporary_bundle is not None:
+                await temporary_bundle.close()
 
 
 class _DefaultLogs:
@@ -525,31 +540,31 @@ class _DefaultServices:
                 health["umlautadaptarr"] = umlaut
 
         library_connectors: dict[str, Any] = {}
-        if path_mapper is not None:
-            for name, connector_type in (
-                ("radarr", RadarrConnector),
-                ("sonarr", SonarrConnector),
-            ):
-                connector_settings = getattr(settings, name)
-                base_url = self._url(connector_settings.base_url)
-                api_key = connector_settings.api_key.get_secret_value()
-                if not connector_settings.enabled or base_url is None or not api_key:
-                    continue
-                try:
-                    connector = connector_type(
-                        base_url=base_url,
-                        api_key=api_key,
-                        path_mapper=path_mapper,
-                    )
-                except Exception as error:
-                    LOGGER.warning(
-                        "%s runtime unavailable (%s)",
-                        name,
-                        sanitized_error(error),
-                    )
-                    continue
-                closeables.append(connector)
-                health[name] = connector
+        for name, connector_type in (
+            ("radarr", RadarrConnector),
+            ("sonarr", SonarrConnector),
+        ):
+            connector_settings = getattr(settings, name)
+            base_url = self._url(connector_settings.base_url)
+            api_key = connector_settings.api_key.get_secret_value()
+            if not connector_settings.enabled or base_url is None or not api_key:
+                continue
+            try:
+                connector = connector_type(
+                    base_url=base_url,
+                    api_key=api_key,
+                    path_mapper=path_mapper,
+                )
+            except Exception as error:
+                LOGGER.warning(
+                    "%s runtime unavailable (%s)",
+                    name,
+                    sanitized_error(error),
+                )
+                continue
+            closeables.append(connector)
+            health[name] = connector
+            if path_mapper is not None:
                 library_connectors[name] = (
                     _ReleaseResolvingLibraryConnector(connector, umlaut)
                     if umlaut is not None
@@ -810,7 +825,7 @@ def create_app(
 
     application = FastAPI(
         title="Crowdarrr",
-        version="0.1.1",
+        version="0.1.2",
         docs_url=None,
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -952,11 +967,19 @@ def create_app(
         return _jsonable(resolved)
 
     @application.post("/api/connectors/{connector}/test")
-    async def test_connector(connector: str) -> Any:
+    async def test_connector(
+        connector: str,
+        patch: dict[str, Any] | None = None,
+    ) -> Any:
         if connector not in _CONNECTOR_NAMES:
             return JSONResponse({"detail": "connector not found"}, status_code=404)
         try:
-            result = await service_container.connectors.test(connector)
+            result = await service_container.connectors.test(connector, patch)
+        except ValidationError:
+            return JSONResponse(
+                {"detail": "invalid connector settings"},
+                status_code=422,
+            )
         except Exception as error:
             detail = sanitized_error(error)
             LOGGER.warning("connector test failed: %s (%s)", connector, detail)

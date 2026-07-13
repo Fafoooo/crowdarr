@@ -184,7 +184,7 @@ class FakeQBit:
     def __init__(
         self,
         snapshots: list[TorrentSnapshot],
-        files: dict[str, list[TorrentFile]],
+        files: dict[str, list[TorrentFile] | Exception],
         *,
         list_error: Exception | None = None,
         health: ConnectorHealth | None = None,
@@ -204,11 +204,17 @@ class FakeQBit:
 
     async def list_files(self, torrent_hash: str) -> list[TorrentFile]:
         self.calls.append(("list_files", torrent_hash))
-        return self.files[torrent_hash]
+        result = self.files[torrent_hash]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     async def get_torrent(self, torrent_hash: str) -> TorrentSnapshot:
         self.calls.append(("get_torrent", torrent_hash))
         snapshot = self.snapshots[torrent_hash]
+        files = self.files[torrent_hash]
+        if isinstance(files, Exception):
+            raise files
         if torrent_hash not in self.rechecked:
             return TorrentSnapshot(
                 torrent_hash=snapshot.torrent_hash,
@@ -217,7 +223,7 @@ class FakeQBit:
                 content_path=snapshot.content_path,
                 progress=snapshot.progress,
                 state=snapshot.state,
-                files=self.files[torrent_hash],
+                files=files,
             )
         return torrent_snapshot(
             torrent_hash,
@@ -399,6 +405,35 @@ async def test_discovery_hydrates_qbit_files_and_exposes_only_stuck_candidates(
 
 
 @pytest.mark.asyncio
+async def test_discovery_skips_one_unavailable_file_list_and_keeps_scanning(
+    tmp_path: Path,
+) -> None:
+    unavailable = torrent_snapshot("unavailable", "Release.Unavailable-GROUP")
+    stuck = torrent_snapshot("stuck", "Release.Stuck-GROUP")
+    qbit = FakeQBit(
+        [unavailable, stuck],
+        {
+            unavailable.torrent_hash: ConnectionError("torrent disappeared"),
+            stuck.torrent_hash: torrent_files(stuck.name),
+        },
+    )
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=FakeRuntimeStore(),
+        qbit=qbit,
+    )
+
+    candidates = await runtime.discover_stuck_torrents()
+
+    assert [candidate.torrent_hash for candidate in candidates] == ["stuck"]
+    assert qbit.calls == [
+        ("list_torrents",),
+        ("list_files", "unavailable"),
+        ("list_files", "stuck"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_scan_and_repair_preserves_bytes_and_persists_job_counters_and_miss(
     tmp_path: Path,
 ) -> None:
@@ -540,6 +575,56 @@ async def test_runtime_batches_missing_nfos_and_counts_one_repaired_torrent(
     assert store.counters["fetched"] == 2
     assert store.counters["matches"] == 2
     assert store.counters["repaired"] == 1
+
+
+@pytest.mark.asyncio
+async def test_downloaded_nfos_count_as_fetches_and_matches_before_verification(
+    tmp_path: Path,
+) -> None:
+    timeout = torrent_snapshot("timeout", "Release.Timeout-GROUP")
+    mismatch = torrent_snapshot("mismatch", "Release.Mismatch-GROUP")
+    repair = FakeRepairService(
+        {
+            timeout.torrent_hash: RepairResult(
+                status=RepairStatus.TIMEOUT,
+                target_path=tmp_path / "timeout.nfo",
+                retryable=True,
+            ),
+            mismatch.torrent_hash: RepairResult(
+                status=RepairStatus.MISMATCH,
+                target_path=tmp_path / "mismatch.nfo",
+                retryable=True,
+            ),
+        }
+    )
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=FakeQBit(
+            [timeout, mismatch],
+            {
+                timeout.torrent_hash: torrent_files(timeout.name),
+                mismatch.torrent_hash: torrent_files(mismatch.name),
+            },
+        ),
+        repair_service=repair,
+    )
+
+    outcome = await runtime.scan_and_repair()
+
+    assert outcome.status == "failed"
+    assert store.counters == {
+        "fetched": 2,
+        "matches": 2,
+        "misses": 0,
+        "repaired": 0,
+        "uploaded": 0,
+    }
+    assert {activity["title"] for activity in store.activities} == {
+        "NFO mismatch",
+        "Verification timed out",
+    }
 
 
 @pytest.mark.asyncio
@@ -716,6 +801,68 @@ async def test_dashboard_snapshot_combines_health_counters_activity_and_stuck(
     assert len(snapshot.stuck_torrents) == 1
     assert snapshot.stuck_torrents[0].hash == "dashboard"
     assert snapshot.stuck_torrents[0].missing_nfo_path.endswith(".nfo")
+
+
+@pytest.mark.asyncio
+async def test_dashboard_groups_nfos_and_exposes_every_incomplete_torrent(
+    tmp_path: Path,
+) -> None:
+    repairable = torrent_snapshot("ready", "Release.Ready-GROUP")
+    repairable_files = torrent_files(repairable.name)
+    repairable_files.insert(
+        1,
+        TorrentFile(
+            index=9,
+            path=f"{repairable.name}/{repairable.name}.proof.nfo",
+            size=4_096,
+            progress=0.0,
+            priority=0,
+        ),
+    )
+    video_incomplete = torrent_snapshot("video", "Release.Video-GROUP")
+    video_files = torrent_files(video_incomplete.name)
+    video_files[1] = TorrentFile(
+        index=8,
+        path=f"{video_incomplete.name}/{video_incomplete.name}.mkv",
+        size=8_000_000_000,
+        progress=0.75,
+        priority=1,
+    )
+    no_nfo = torrent_snapshot("no-nfo", "Release.NoNfo-GROUP")
+    no_nfo_files = [torrent_files(no_nfo.name)[1]]
+    complete = torrent_snapshot(
+        "complete",
+        "Release.Complete-GROUP",
+        progress=1.0,
+        state="stalledUP",
+    )
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=FakeRuntimeStore(),
+        qbit=FakeQBit(
+            [repairable, video_incomplete, no_nfo, complete],
+            {
+                repairable.torrent_hash: repairable_files,
+                video_incomplete.torrent_hash: video_files,
+                no_nfo.torrent_hash: no_nfo_files,
+                complete.torrent_hash: torrent_files(complete.name, nfo_progress=1.0),
+            },
+        ),
+    )
+
+    snapshot = await runtime.dashboard_snapshot()
+
+    torrents = {torrent.hash: torrent for torrent in snapshot.stuck_torrents}
+    assert set(torrents) == {"ready", "video", "no-nfo"}
+    assert torrents["ready"].repairable is True
+    assert torrents["ready"].missing_nfo_count == 2
+    assert torrents["ready"].reason == "ready"
+    assert torrents["video"].repairable is False
+    assert torrents["video"].missing_nfo_count == 1
+    assert torrents["video"].reason == "video_incomplete"
+    assert torrents["no-nfo"].repairable is False
+    assert torrents["no-nfo"].missing_nfo_count == 0
+    assert torrents["no-nfo"].reason == "no_incomplete_nfo"
 
 
 @pytest.mark.asyncio

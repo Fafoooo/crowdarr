@@ -82,7 +82,15 @@ class ActionsStub:
 
 
 class ConnectorsStub:
-    async def test(self, connector: str) -> dict[str, str]:
+    def __init__(self) -> None:
+        self.last_patch: dict[str, Any] | None = None
+
+    async def test(
+        self,
+        connector: str,
+        patch: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        self.last_patch = patch
         return {"connector": connector, "status": "healthy"}
 
 
@@ -266,16 +274,51 @@ async def test_settings_encryption_failure_returns_actionable_safe_error(
 
 @pytest.mark.asyncio
 async def test_connector_routes_reject_unknown_names_and_serialize_results() -> None:
-    app = create_app(services=service_stub(), api_token="")
+    services = service_stub()
+    app = create_app(services=services, api_token="")
 
     async with client_for(app) as client:
         unknown = await client.post("/api/connectors/not-a-service/test")
-        known = await client.post("/api/connectors/radarr/test")
+        known = await client.post(
+            "/api/connectors/crowdnfo/test",
+            json={
+                "api_key": "draft-key",
+                "base_url": "https://community.example",
+            },
+        )
 
     assert unknown.status_code == 404
     assert unknown.json() == {"detail": "connector not found"}
     assert known.status_code == 200
-    assert known.json() == {"connector": "radarr", "status": "healthy"}
+    assert known.json() == {"connector": "crowdnfo", "status": "healthy"}
+    assert services.connectors.last_patch == {
+        "api_key": "draft-key",
+        "base_url": "https://community.example",
+    }
+
+
+@pytest.mark.asyncio
+async def test_connector_test_rejects_an_invalid_draft_as_user_input() -> None:
+    class Settings:
+        async def get(self) -> AppSettings:
+            return AppSettings()
+
+    default_services = main_module._DefaultServices(
+        settings=cast(Any, Settings()),
+        operations=cast(Any, SimpleNamespace()),
+    )
+    services = service_stub()
+    services.connectors = default_services.connectors
+    app = create_app(services=services, api_token="")
+
+    async with client_for(app) as client:
+        response = await client.post(
+            "/api/connectors/crowdnfo/test",
+            json={"api_key": "draft-key", "base_url": "not-a-url"},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid connector settings"}
 
 
 @pytest.mark.asyncio
@@ -631,3 +674,97 @@ async def test_default_connector_test_reports_disabled_incomplete_and_health() -
     assert healthy["status"] == "healthy"
     assert healthy["message"] == "5.1.0"
     assert isinstance(healthy["latency_ms"], int)
+
+
+@pytest.mark.asyncio
+async def test_default_connector_test_uses_draft_without_persisting_it() -> None:
+    persisted = AppSettings()
+
+    class Settings:
+        async def get(self) -> AppSettings:
+            return persisted
+
+    class Healthy:
+        async def healthcheck(self) -> ConnectorHealth:
+            return ConnectorHealth(True, version="draft")
+
+    class CandidateBundle:
+        def __init__(self) -> None:
+            self.health_connectors = {"crowdnfo": Healthy()}
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    services = main_module._DefaultServices(
+        settings=cast(Any, Settings()),
+        operations=cast(Any, SimpleNamespace()),
+    )
+    candidate_bundle = CandidateBundle()
+    candidate: AppSettings | None = None
+
+    def compose(settings: AppSettings) -> Any:
+        nonlocal candidate
+        candidate = settings
+        return candidate_bundle
+
+    services._compose_bundle = compose  # type: ignore[method-assign]
+
+    result = await services.connectors.test(
+        "crowdnfo",
+        {
+            "api_key": "draft-key",
+            "base_url": "https://community.example",
+        },
+    )
+
+    assert result["status"] == "healthy"
+    assert result["message"] == "draft"
+    assert candidate is not None
+    assert str(candidate.crowdnfo.base_url).rstrip("/") == "https://community.example"
+    assert candidate.crowdnfo.api_key.get_secret_value() == "draft-key"
+    assert persisted.crowdnfo.api_key.get_secret_value() == ""
+    assert candidate_bundle.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connector_name", ["radarr", "sonarr"])
+async def test_library_connector_draft_health_does_not_require_path_mapping(
+    connector_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Settings:
+        async def get(self) -> AppSettings:
+            return AppSettings()
+
+    class HealthyLibraryConnector:
+        def __init__(self, **kwargs: Any) -> None:
+            assert kwargs["path_mapper"] is None
+
+        async def healthcheck(self) -> ConnectorHealth:
+            return ConnectorHealth(True, version="draft")
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        main_module,
+        "RadarrConnector" if connector_name == "radarr" else "SonarrConnector",
+        HealthyLibraryConnector,
+    )
+    services = main_module._DefaultServices(
+        settings=cast(Any, Settings()),
+        operations=cast(Any, SimpleNamespace()),
+    )
+
+    result = await services.connectors.test(
+        connector_name,
+        {
+            "enabled": True,
+            "base_url": f"http://{connector_name}:8080",
+            "api_key": "draft-key",
+        },
+    )
+
+    assert result["status"] == "healthy"
+    assert result["message"] == "draft"

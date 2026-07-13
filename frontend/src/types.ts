@@ -30,9 +30,19 @@ export interface ActivityItem {
 export interface StuckTorrent {
   category: string;
   hash: string;
+  missing_nfo_count: number;
   missing_nfo_path: string;
   name: string;
   progress: number;
+  reason:
+    | "ready"
+    | "no_incomplete_nfo"
+    | "no_video"
+    | "video_incomplete"
+    | "invalid_nfo_path"
+    | "inspection_failed";
+  repairable: boolean;
+  state: string;
 }
 
 export interface DashboardData {

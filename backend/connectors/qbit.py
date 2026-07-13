@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
@@ -48,6 +48,26 @@ class MissingNFO:
     file_index: int
     relative_path: PurePosixPath
     reported_path: PurePosixPath
+
+
+NFOReadiness = Literal[
+    "complete",
+    "ready",
+    "no_incomplete_nfo",
+    "no_video",
+    "video_incomplete",
+    "invalid_nfo_path",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class NFORepairAssessment:
+    """Explain whether an incomplete torrent is ready for NFO-only repair."""
+
+    status: NFOReadiness
+    candidates: tuple[MissingNFO, ...] = ()
+    incomplete_nfo_count: int = 0
+    reported_nfo_paths: tuple[PurePosixPath, ...] = ()
 
 
 def reported_file_path(
@@ -95,34 +115,59 @@ def reported_file_path(
     return content_path.joinpath(relative)
 
 
-def find_stuck_nfos(
+def assess_nfo_repair(
     torrent: TorrentSnapshot,
     *,
     video_threshold: float = 0.99,
-) -> list[MissingNFO]:
-    """Return incomplete NFOs only when all video payloads are nearly complete."""
+) -> NFORepairAssessment:
+    """Classify an incomplete torrent and retain safe NFO repair candidates."""
 
     if not 0 <= video_threshold <= 1:
         raise ValueError("video_threshold must be between zero and one")
     if torrent.progress >= 1:
-        return []
+        return NFORepairAssessment(status="complete")
+
+    incomplete_nfos = [
+        item
+        for item in torrent.files
+        if PurePosixPath(item.path).suffix.lower() == ".nfo" and item.progress < 1
+    ]
+    if not incomplete_nfos:
+        return NFORepairAssessment(status="no_incomplete_nfo")
 
     videos = [
         item
         for item in torrent.files
         if PurePosixPath(item.path).suffix.lower() in VIDEO_SUFFIXES
     ]
-    if not videos or any(item.progress < video_threshold for item in videos):
-        return []
+    reported_paths = tuple(
+        path
+        for item in incomplete_nfos
+        if (path := reported_file_path(torrent, item.path)) is not None
+    )
+    if not videos:
+        return NFORepairAssessment(
+            status="no_video",
+            incomplete_nfo_count=len(incomplete_nfos),
+            reported_nfo_paths=reported_paths,
+        )
+    if any(item.progress < video_threshold for item in videos):
+        return NFORepairAssessment(
+            status="video_incomplete",
+            incomplete_nfo_count=len(incomplete_nfos),
+            reported_nfo_paths=reported_paths,
+        )
 
     missing: list[MissingNFO] = []
-    for item in torrent.files:
+    for item in incomplete_nfos:
         relative = PurePosixPath(item.path)
-        if relative.suffix.lower() != ".nfo" or item.progress >= 1:
-            continue
         reported_path = reported_file_path(torrent, relative)
         if reported_path is None:
-            continue
+            return NFORepairAssessment(
+                status="invalid_nfo_path",
+                incomplete_nfo_count=len(incomplete_nfos),
+                reported_nfo_paths=reported_paths,
+            )
         missing.append(
             MissingNFO(
                 torrent_hash=torrent.torrent_hash,
@@ -132,7 +177,22 @@ def find_stuck_nfos(
                 reported_path=reported_path,
             )
         )
-    return missing
+    return NFORepairAssessment(
+        status="ready",
+        candidates=tuple(missing),
+        incomplete_nfo_count=len(incomplete_nfos),
+        reported_nfo_paths=reported_paths,
+    )
+
+
+def find_stuck_nfos(
+    torrent: TorrentSnapshot,
+    *,
+    video_threshold: float = 0.99,
+) -> list[MissingNFO]:
+    """Return NFO candidates only when the torrent is ready for NFO-only repair."""
+
+    return list(assess_nfo_repair(torrent, video_threshold=video_threshold).candidates)
 
 
 class QBitConnector:

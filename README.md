@@ -63,7 +63,8 @@ definition as a local fallback; `docker compose pull` uses the configured image.
 ## First-run checklist
 
 1. Start in **dry-run** mode and leave contribution disabled.
-2. Add the CrowdNFO URL and API key, choose **Save settings**, then use **Test**.
+2. Add the CrowdNFO URL and API key, use **Test** on those current values, then
+   choose **Save settings**.
 3. Add one connector at a time and verify its health.
 4. Confirm every connector path maps to a path visible inside Crowdarrr.
 5. Run **Scan & Repair now** and inspect activity before enabling scheduled
@@ -74,6 +75,11 @@ definition as a local fallback; `docker compose pull` uses the configured image.
 Settings are authoritative in SQLite and are managed through the UI.
 [`config.example.yaml`](config.example.yaml) documents the schema but is not
 currently imported at startup.
+
+Connection tests use the values currently visible in the form without saving
+them. Tests never persist drafts. After a successful save, secret fields are
+cleared intentionally because secrets are write-only; **Configured** and an
+enabled **Test** button confirm that the encrypted value is stored.
 
 ## Connector and path setup
 
@@ -97,6 +103,14 @@ progress, and essentially complete video content. Crowdarrr writes only the
 expected NFO path, sets its priority to normal, requests a recheck, and waits for
 completion. Username/password may be blank only when qBittorrent's own trusted
 network authentication policy permits it.
+
+The dashboard lists every qBittorrent download below 100%, one row per torrent.
+Only rows that satisfy the NFO repair criteria expose **Repair**; the other rows
+show why they are not repairable, such as incomplete video data or no incomplete
+NFO. Counter meanings are deliberately distinct: a downloaded CrowdNFO payload
+counts as **fetched** and **matched**, even if qBittorrent verification later
+times out or detects a mismatch; only a verified 100% result counts as
+**repaired**, and only failed lookups count as **misses**.
 
 Radarr and Sonarr may rename media, so scene/original names and optional
 UmlautAdaptarr title recovery are important fallbacks. Library sidecars do not
@@ -230,6 +244,9 @@ network and tracker policy.
 - **Connector is healthy but files are not found:** compare the exact path
   reported by the connector with the path inside the Crowdarrr container; add a
   path mapping or use identical mounts.
+- **A saved API key disappears from its field:** this is expected write-only
+  secret behavior. Look for **Configured** and use **Test**; leaving the field
+  blank preserves the stored secret.
 - **qBittorrent returns 403/login errors:** supply WebUI credentials or correct
   qBittorrent's trusted-subnet policy. Do not assume an auth whitelist applies
   across Docker networks.
