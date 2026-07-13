@@ -155,6 +155,11 @@ while using the web UI, a trusted reverse proxy must inject
 authenticate users. The token is therefore useful for API clients or proxy
 injection, not transparent browser authentication.
 
+API clients may instead set the write-only `application_api_token` through the
+settings API; an environment token takes precedence. This takes effect
+immediately, so configure proxy injection before enabling it. The browser form
+deliberately does not expose this lockout-prone control.
+
 Connector credentials are stored in SQLite and encrypted with a Fernet master
 key. When `CROWDARRR_MASTER_KEY` is unset, Crowdarrr creates a mode-`0600` key in
 the configuration directory. Back up that key with the database. Supplying the
@@ -242,6 +247,10 @@ Most importantly:
 - Current contribution routes are
   `POST /api/releases/{release_name}/files` for multipart NFO/MediaInfo and
   `POST /api/releases/{release_name}/filelists` for file lists.
+- The current best-file route selects one NFO and has no relative-path selector.
+  Torrents with several missing NFO entries are repaired as one batch using that
+  response and accepted only if qBittorrent verifies every entry; otherwise the
+  batch remains a clear, retryable mismatch.
 
 Endpoint strings are isolated in `backend/crowdnfo/endpoints.py` so a beta API
 change is small and reviewable. Automated tests exercise mocked contracts, but

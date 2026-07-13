@@ -59,8 +59,10 @@ category_mappings:
 backfill_cron: "0 3 * * *"
 dry_run: true
 
-# Protect /api with CROWDARRR_API_TOKEN in the process environment. Runtime API
-# authentication is deliberately not activated by a value in this UI schema.
+# Protect /api with CROWDARRR_API_TOKEN in the process environment. API clients
+# can alternatively set the write-only application_api_token through
+# /api/settings; the browser form omits it to avoid locking itself out without
+# proxy injection.
 # The optional SAB webhook likewise uses CROWDARRR_SAB_WEBHOOK_SECRET from the
 # environment, never a connector API key.
 # Queue, hashing, polling, webhook-size, and health-check bounds are also runtime

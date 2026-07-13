@@ -24,6 +24,8 @@ All notable changes to this project are documented here. The format follows
   bound background action, hashing, polling, and health-check work.
 - Remove recursive ownership changes from container startup and restrict
   automatic ownership repair to known state files under `/config`.
+- Preserve an NFO that another process replaces while qBittorrent is rechecking;
+  mismatch cleanup removes only the exact payload Crowdarrr placed.
 - Raise vulnerable `cryptography`, Black, and pytest dependency ranges to fixed
   releases.
 

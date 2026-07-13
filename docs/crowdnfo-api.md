@@ -43,6 +43,11 @@ verification.
 4. **Beta stability:** response shapes and endpoint paths can change. A missing
    `fileId` is treated as a contract error, not guessed. Unknown download
    endpoints are never tried because an incorrect NFO is worse than a clear miss.
+5. **One best NFO response:** the current lookup has no relative-path selector.
+   When a torrent reports several missing NFO entries, Crowdarrr places the one
+   best-file response as a batch and reports success only if qBittorrent verifies
+   every entry. A partial or failed verification is retained as a retryable,
+   explicitly logged mismatch.
 
 These are implementation assumptions, not a claim that live integration was
 verified with a production account during repository creation. Contract tests use
