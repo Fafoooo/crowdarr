@@ -73,6 +73,7 @@ class SABLiveActionResult:
     performed: bool
     terminal: bool = True
     value: object | None = None
+    warning: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +84,7 @@ class SABWebhookResult:
     # None preserves the pre-v0.1.3 contract: successful attempted actions count.
     performed_actions: tuple[str, ...] | None = None
     deferred_actions: tuple[str, ...] = ()
+    warnings: Mapping[str, str] = field(default_factory=dict)
 
 
 class SABnzbdConnector:
@@ -204,6 +206,7 @@ class SABWebhookHandler:
         performed_actions: list[str] = []
         deferred_actions: list[str] = []
         errors: dict[str, str] = {}
+        warnings: dict[str, str] = {}
         operations = (
             ("fetch", self._fetch_enabled, self._live_service.fetch_missing),
             ("contribute", self._contribute_enabled, self._live_service.contribute),
@@ -226,6 +229,8 @@ class SABWebhookHandler:
                         performed_actions.append(name)
                     if not operation_result.terminal:
                         deferred_actions.append(name)
+                    if operation_result.warning:
+                        warnings[name] = operation_result.warning
                 else:
                     # Third-party/legacy services only signalled failure by raising.
                     performed_actions.append(name)
@@ -235,4 +240,5 @@ class SABWebhookHandler:
             errors=errors,
             performed_actions=tuple(performed_actions),
             deferred_actions=tuple(deferred_actions),
+            warnings=warnings,
         )

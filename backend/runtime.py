@@ -818,14 +818,35 @@ class SABLiveWorkflow:
             include_mediainfo=self._settings.contribute.mediainfo,
             include_filelist=self._settings.contribute.filelist,
         )
-        performed = (
-            contribution_result.status == "success"
-            if isinstance(contribution_result, ContributionResult)
-            else contribution_result is not None
-        )
+        warning: str | None = None
+        terminal = True
+        if isinstance(contribution_result, ContributionResult):
+            performed = contribution_result.status in {"success", "partial"}
+            failed_components = [
+                f"{name}: {component.error or 'failed'}"
+                for name, component in contribution_result.components.items()
+                if component.status == "failed"
+            ]
+            if contribution_result.status == "partial":
+                warning = "partial contribution; " + (
+                    ", ".join(failed_components)
+                    if failed_components
+                    else "some components failed"
+                )
+            elif contribution_result.status == "failed":
+                warning = "contribution failed; " + (
+                    ", ".join(failed_components)
+                    if failed_components
+                    else "all enabled components failed"
+                )
+                terminal = False
+        else:
+            performed = contribution_result is not None
         return SABLiveActionResult(
             performed=performed,
+            terminal=terminal,
             value=contribution_result,
+            warning=warning,
         )
 
 
@@ -954,6 +975,9 @@ class QBitCompletedPoller:
                     continue
                 actions: list[str] = []
                 errors: dict[str, str] = {}
+                performed_actions: list[str] = []
+                deferred_actions: list[str] = []
+                warnings: dict[str, str] = {}
                 operations = (
                     ("fetch", self._fetch_enabled, self._live_service.fetch_missing),
                     (
@@ -991,11 +1015,27 @@ class QBitCompletedPoller:
                             name,
                             operation_result,
                         )
+                        action_warning = (
+                            operation_result.warning
+                            if isinstance(operation_result, SABLiveActionResult)
+                            else None
+                        )
+                        if performed:
+                            performed_actions.append(name)
+                        if action_warning:
+                            warnings[name] = action_warning
+                        if not self._action_is_terminal(operation_result):
+                            deferred_actions.append(name)
                         await self._record_action(
                             torrent,
                             name,
                             performed=performed,
-                            status="success" if performed else "info",
+                            status=(
+                                "warning"
+                                if action_warning
+                                else "success" if performed else "info"
+                            ),
+                            detail=action_warning,
                         )
                         if self._action_is_terminal(operation_result):
                             await self._store.mark_completed(action_key)
@@ -1003,6 +1043,9 @@ class QBitCompletedPoller:
                     accepted=True,
                     actions=tuple(actions),
                     errors=errors,
+                    performed_actions=tuple(performed_actions),
+                    deferred_actions=tuple(deferred_actions),
+                    warnings=warnings,
                 )
                 results[torrent.torrent_hash] = result
                 enabled_actions = tuple(
@@ -1802,6 +1845,7 @@ class CrowdarrrRuntime:
         )
         successes = 0
         failures = 0
+        warnings = 0
         for action in result.actions:
             action_error = result.errors.get(action)
             if action_error is not None:
@@ -1814,6 +1858,16 @@ class CrowdarrrRuntime:
                 )
                 continue
             if action not in performed_actions:
+                action_warning = result.warnings.get(action)
+                if action_warning is not None:
+                    failures += 1
+                    await self._store.record_activity(
+                        activity_type=f"sab_{action}",
+                        status="warning",
+                        title=f"SAB {action} failed",
+                        message=f"{event.release_name} — {action_warning}",
+                    )
+                    continue
                 await self._store.record_activity(
                     activity_type=f"sab_{action}",
                     status="info",
@@ -1827,14 +1881,25 @@ class CrowdarrrRuntime:
                     await self._store.increment_counter(counter)
             elif action == "contribute":
                 await self._store.increment_counter("uploaded")
+            action_warning = result.warnings.get(action)
+            if action_warning is not None:
+                warnings += 1
             await self._store.record_activity(
                 activity_type=f"sab_{action}",
-                status="success",
-                title=f"SAB {action} complete",
-                message=f"{event.release_name} — {action} complete",
+                status="warning" if action_warning else "success",
+                title=(
+                    f"SAB {action} partially complete"
+                    if action_warning
+                    else f"SAB {action} complete"
+                ),
+                message=(
+                    f"{event.release_name} — {action_warning}"
+                    if action_warning
+                    else f"{event.release_name} — {action} complete"
+                ),
             )
 
-        if failures and successes:
+        if successes and (failures or warnings):
             status: WorkflowStatus = "partial"
         elif failures:
             status = "failed"
@@ -1941,7 +2006,6 @@ class CrowdarrrRuntime:
         legacy_targets = await targets_method() if callable(targets_method) else set()
         placed_outcomes = {
             "fixed",
-            "mismatch",
             "placed",
             "verification_pending",
             "verified_incomplete",
