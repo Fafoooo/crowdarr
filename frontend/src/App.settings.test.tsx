@@ -151,7 +151,7 @@ describe("settings", () => {
     ).toHaveLength(6);
   });
 
-  it("honestly tests persisted connector settings and announces the result", async () => {
+  it("honestly tests the current connector values and announces the result", async () => {
     let testRequest: MockRequest | undefined;
     installFetchMock({
       "GET /api/settings": jsonResponse(settingsPublicView),
@@ -177,18 +177,31 @@ describe("settings", () => {
       }),
     );
 
-    expect(testRequest?.body).toBeUndefined();
+    expect(JSON.parse(String(testRequest?.body))).toEqual({
+      base_url: "http://qbittorrent:8080/",
+      enabled: true,
+      username: "crowdarrr",
+    });
     const status = await screen.findByRole("status");
     expect(status).toHaveTextContent(/connected to qBittorrent/i);
     expect(status).toHaveTextContent(/18 ms/i);
     expect(
-      screen.getByText(/connection tests use .*saved settings/i),
-    ).toHaveTextContent(/save changes before testing/i);
+      screen.getByText(/connection tests use the values currently shown/i),
+    ).toHaveTextContent(/without saving them/i);
   });
 
-  it("requires saving changed connection fields before testing", async () => {
+  it("tests changed connector fields without saving them", async () => {
+    let testRequest: MockRequest | undefined;
     installFetchMock({
       "GET /api/settings": jsonResponse(settingsPublicView),
+      "POST /api/connectors/qbittorrent/test": (request) => {
+        testRequest = request;
+        return jsonResponse({
+          latency_ms: 8,
+          message: "Connected to qBittorrent",
+          status: "healthy",
+        });
+      },
     });
     const user = userEvent.setup();
 
@@ -204,11 +217,21 @@ describe("settings", () => {
     const testButton = within(qbittorrent).getByRole("button", {
       name: /test qBittorrent connection/i,
     });
-    expect(testButton).toBeDisabled();
-    expect(testButton).toHaveTextContent(/save first/i);
+    expect(testButton).toBeEnabled();
+    await user.click(testButton);
+
+    expect(JSON.parse(String(testRequest?.body))).toEqual({
+      base_url: "http://unsaved-qbit:8080",
+      enabled: true,
+      username: "crowdarrr",
+    });
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      /connected to qBittorrent/i,
+    );
   });
 
-  it("does not claim CrowdNFO is connected without a persisted API key", async () => {
+  it("tests a draft CrowdNFO API key without saving or clearing it", async () => {
+    let testRequest: MockRequest | undefined;
     installFetchMock({
       "GET /api/settings": jsonResponse({
         ...settingsPublicView,
@@ -217,6 +240,14 @@ describe("settings", () => {
           crowdnfo_api_key: false,
         },
       }),
+      "POST /api/connectors/crowdnfo/test": (request) => {
+        testRequest = request;
+        return jsonResponse({
+          latency_ms: 12,
+          message: "Connected to CrowdNFO",
+          status: "healthy",
+        });
+      },
     });
     const user = userEvent.setup();
 
@@ -228,9 +259,60 @@ describe("settings", () => {
     expect(testButton).toBeDisabled();
     expect(testButton).toHaveTextContent(/API key required/i);
 
-    await user.type(screen.getByLabelText("CrowdNFO API key"), "unsaved-key");
-    expect(testButton).toBeDisabled();
-    expect(testButton).toHaveTextContent(/save first/i);
+    const apiKey = screen.getByLabelText("CrowdNFO API key");
+    await user.type(apiKey, "unsaved-key");
+
+    expect(testButton).toBeEnabled();
+    expect(testButton).toHaveTextContent(/^test$/i);
+    await user.click(testButton);
+
+    expect(JSON.parse(String(testRequest?.body))).toEqual({
+      api_key: "unsaved-key",
+      base_url: "https://crowdnfo.net/",
+    });
+    expect(apiKey).toHaveValue("unsaved-key");
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      /connected to CrowdNFO/i,
+    );
+  });
+
+  it("keeps CrowdNFO testing available after a saved key becomes write-only", async () => {
+    const withoutKey = {
+      ...settingsPublicView,
+      secrets_configured: {
+        ...settingsPublicView.secrets_configured,
+        crowdnfo_api_key: false,
+      },
+    };
+    installFetchMock({
+      "GET /api/settings": jsonResponse(withoutKey),
+      "PUT /api/settings": jsonResponse({
+        ...withoutKey,
+        secrets_configured: {
+          ...withoutKey.secrets_configured,
+          crowdnfo_api_key: true,
+        },
+      }),
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    const apiKey = await screen.findByLabelText("CrowdNFO API key");
+    await user.type(apiKey, "saved-key");
+    await user.click(screen.getByRole("button", { name: "Save settings" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      /settings saved/i,
+    );
+    expect(apiKey).toHaveValue("");
+    expect(apiKey).toHaveAttribute(
+      "placeholder",
+      expect.stringMatching(/configured/i),
+    );
+    expect(
+      screen.getByRole("button", { name: /test CrowdNFO connection/i }),
+    ).toBeEnabled();
   });
 
   it("offers only valid CrowdNFO categories instead of asking for a save path", async () => {

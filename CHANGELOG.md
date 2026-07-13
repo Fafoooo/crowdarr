@@ -6,6 +6,34 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-13
+
+### Added
+
+- Show every incomplete qBittorrent download on the dashboard with a precise
+  repair-readiness reason and expose **Repair** only for valid missing-NFO
+  candidates.
+- Record live qBittorrent fetch and contribution outcomes in activity and counters
+  with independent idempotency for each action.
+
+### Fixed
+
+- Test CrowdNFO and all optional connectors against the current unsaved form
+  values, keep draft secrets available during the test, and preserve the
+  write-only configured-secret state after saving.
+- Allow Radarr and Sonarr connection health tests before path mappings are added;
+  mappings remain mandatory for library scans.
+- Count successful CrowdNFO downloads and matches independently from subsequent
+  torrent verification, while reserving misses for lookup failures and repaired
+  for verified 100% torrents.
+- Migrate existing activity-derived dashboard counters once so verification
+  timeouts and NFO mismatches are no longer reported as CrowdNFO misses.
+- Continue incomplete-torrent discovery when qBittorrent cannot return the file
+  list for one torrent, and group multiple missing NFO paths into one dashboard
+  row.
+- Prevent the dashboard action column from clipping at desktop widths and keep the
+  table contained on mobile layouts.
+
 ## [0.1.1] - 2026-07-13
 
 ### Added
@@ -58,6 +86,7 @@ All notable changes to this project are documented here. The format follows
 - YAML configuration is illustrative and is not automatically imported; the UI
   and SQLite are authoritative.
 
-[Unreleased]: https://github.com/Fafoooo/crowdarr/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Fafoooo/crowdarr/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Fafoooo/crowdarr/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Fafoooo/crowdarr/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Fafoooo/crowdarr/releases/tag/v0.1.0

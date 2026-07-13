@@ -310,7 +310,11 @@ class FakeActions:
 
 
 class FakeConnectors:
-    async def test(self, connector: str) -> dict[str, Any]:
+    async def test(
+        self,
+        connector: str,
+        patch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         raise ConnectionError(f"{connector} unavailable; password=must-not-leak")
 
 

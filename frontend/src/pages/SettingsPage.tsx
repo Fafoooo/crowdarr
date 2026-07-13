@@ -413,24 +413,72 @@ function ConnectorFieldset({
   );
 }
 
+function buildConnectorPayload(
+  connector: ConnectorSettings,
+  secret?: { field: "api_key" | "password"; value: string },
+): Record<string, unknown> {
+  const baseUrl = connector.url.trim();
+  const username = connector.username?.trim();
+  return {
+    enabled: connector.enabled,
+    base_url: baseUrl || null,
+    ...(username ? { username } : {}),
+    ...(secret?.value ? { [secret.field]: secret.value } : {}),
+  };
+}
+
+function buildConnectorTestPayload(
+  id: ConnectorId,
+  settings: SettingsData,
+  secrets: SecretDrafts,
+): Record<string, unknown> {
+  if (id === "crowdnfo") {
+    return {
+      base_url: settings.crowdnfo.base_url.trim(),
+      ...(secrets.crowdnfo_api_key
+        ? { api_key: secrets.crowdnfo_api_key }
+        : {}),
+    };
+  }
+
+  const definition = connectorDefinitions.find(
+    (candidate) => candidate.id === id,
+  );
+  const secret =
+    definition?.secretKey && definition.secretType
+      ? {
+          field: definition.secretType,
+          value: secrets[definition.secretKey],
+        }
+      : undefined;
+  return buildConnectorPayload(settings.connectors[id], secret);
+}
+
+function connectionTestDisabledReason({
+  enabled = true,
+  secretConfigured = false,
+  secretDraft = "",
+  secretRequired = false,
+  url,
+}: {
+  enabled?: boolean;
+  secretConfigured?: boolean;
+  secretDraft?: string;
+  secretRequired?: boolean;
+  url: string;
+}): string | undefined {
+  if (!enabled) return "Enable first";
+  if (!url.trim()) return "URL required";
+  if (secretRequired && !secretConfigured && !secretDraft.trim()) {
+    return "API key required";
+  }
+  return undefined;
+}
+
 function buildPayload(
   settings: SettingsData,
   secrets: SecretDrafts,
 ): Record<string, unknown> {
-  const connectorPayload = (
-    connector: ConnectorSettings,
-    secret?: { field: "api_key" | "password"; value: string },
-  ) => {
-    const baseUrl = connector.url.trim();
-    const username = connector.username?.trim();
-    return {
-      enabled: connector.enabled,
-      base_url: baseUrl || null,
-      ...(username ? { username } : {}),
-      ...(secret?.value ? { [secret.field]: secret.value } : {}),
-    };
-  };
-
   return {
     auto_recheck: settings.recheck_after_repair,
     backfill_cron: settings.backfill_cron,
@@ -460,23 +508,23 @@ function buildPayload(
         remote_root: connector_path,
       }),
     ),
-    qbittorrent: connectorPayload(settings.connectors.qbittorrent, {
+    qbittorrent: buildConnectorPayload(settings.connectors.qbittorrent, {
       field: "password",
       value: secrets.qbittorrent_password,
     }),
-    radarr: connectorPayload(settings.connectors.radarr, {
+    radarr: buildConnectorPayload(settings.connectors.radarr, {
       field: "api_key",
       value: secrets.radarr_api_key,
     }),
-    sabnzbd: connectorPayload(settings.connectors.sabnzbd, {
+    sabnzbd: buildConnectorPayload(settings.connectors.sabnzbd, {
       field: "api_key",
       value: secrets.sabnzbd_api_key,
     }),
-    sonarr: connectorPayload(settings.connectors.sonarr, {
+    sonarr: buildConnectorPayload(settings.connectors.sonarr, {
       field: "api_key",
       value: secrets.sonarr_api_key,
     }),
-    umlautadaptarr: connectorPayload(settings.connectors.umlautadaptarr),
+    umlautadaptarr: buildConnectorPayload(settings.connectors.umlautadaptarr),
   };
 }
 
@@ -488,7 +536,6 @@ export default function SettingsPage() {
   const [feedback, setFeedback] = useState<string>();
   const [pendingTest, setPendingTest] = useState<ConnectorId>();
   const [saving, setSaving] = useState(false);
-  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
 
   const loadSettings = useCallback(async () => {
     setLoadError(undefined);
@@ -497,7 +544,6 @@ export default function SettingsPage() {
         normaliseSettings(await apiRequest<unknown>("/api/settings")),
       );
       setSecrets(emptySecrets);
-      setHasUnsavedChanges(false);
     } catch (error) {
       setLoadError(errorMessage(error));
     }
@@ -508,12 +554,10 @@ export default function SettingsPage() {
   }, [loadSettings]);
 
   const update = (recipe: (current: SettingsData) => SettingsData) => {
-    setHasUnsavedChanges(true);
     setSettings((current) => (current ? recipe(current) : current));
   };
 
   const updateSecret = (key: SecretKey, value: string) => {
-    setHasUnsavedChanges(true);
     setSecrets((current) => ({ ...current, [key]: value }));
   };
 
@@ -535,9 +579,15 @@ export default function SettingsPage() {
     setActionError(undefined);
     setFeedback(undefined);
     try {
+      const draft = settings
+        ? buildConnectorTestPayload(id, settings, secrets)
+        : undefined;
       const response = await apiRequest<ConnectorTestResponse>(
         `/api/connectors/${id}/test`,
-        { method: "POST" },
+        {
+          ...(draft ? { body: JSON.stringify(draft) } : {}),
+          method: "POST",
+        },
       );
       if (response.status !== "healthy") {
         setActionError(`${label}: ${response.message || response.status}`);
@@ -566,7 +616,6 @@ export default function SettingsPage() {
       });
       setSettings(normaliseSettings(response));
       setSecrets(emptySecrets);
-      setHasUnsavedChanges(false);
       setFeedback("Settings saved");
     } catch (error) {
       setActionError(errorMessage(error));
@@ -587,15 +636,25 @@ export default function SettingsPage() {
   const testDisabledReason = (
     connector: ConnectorSettings,
     definition: (typeof connectorDefinitions)[number],
+    secretDraft?: string,
   ): string | undefined => {
-    if (hasUnsavedChanges) return "Save first";
-    if (!connector.enabled) return "Enable first";
-    if (!connector.url.trim()) return "URL required";
-    if (definition.secretType === "api_key" && !connector.api_key_configured) {
-      return "API key required";
-    }
-    return undefined;
+    return connectionTestDisabledReason({
+      enabled: connector.enabled,
+      secretConfigured: Boolean(connector.api_key_configured),
+      secretDraft,
+      secretRequired: definition.secretType === "api_key",
+      url: connector.url,
+    });
   };
+
+  const crowdnfoTestDisabledReason = settings
+    ? connectionTestDisabledReason({
+        secretConfigured: settings.crowdnfo.api_key_configured,
+        secretDraft: secrets.crowdnfo_api_key,
+        secretRequired: true,
+        url: settings.crowdnfo.base_url,
+      })
+    : undefined;
 
   const updateCategoryMapping = (
     index: number,
@@ -648,8 +707,8 @@ export default function SettingsPage() {
                 Connections
               </h2>
               <p className="mt-1 text-sm text-zinc-400">
-                Connection tests use the last saved settings. Save changes
-                before testing.
+                Connection tests use the values currently shown without saving
+                them.
               </p>
             </div>
 
@@ -667,22 +726,14 @@ export default function SettingsPage() {
                     aria-label="Test CrowdNFO connection"
                     disabled={
                       pendingTest === "crowdnfo" ||
-                      hasUnsavedChanges ||
-                      !settings.crowdnfo.api_key_configured ||
-                      !settings.crowdnfo.base_url.trim()
+                      Boolean(crowdnfoTestDisabledReason)
                     }
                     onClick={() => void testConnector("crowdnfo", "CrowdNFO")}
                     type="button"
                   >
                     {pendingTest === "crowdnfo"
                       ? "Testing…"
-                      : hasUnsavedChanges
-                        ? "Save first"
-                        : !settings.crowdnfo.api_key_configured
-                          ? "API key required"
-                          : !settings.crowdnfo.base_url.trim()
-                            ? "URL required"
-                            : "Test"}
+                      : (crowdnfoTestDisabledReason ?? "Test")}
                   </Button>
                 </div>
                 <div className="grid gap-4 sm:grid-cols-2">
@@ -732,6 +783,9 @@ export default function SettingsPage() {
                   testDisabledReason={testDisabledReason(
                     settings.connectors[definition.id],
                     definition,
+                    definition.secretKey
+                      ? secrets[definition.secretKey]
+                      : undefined,
                   )}
                 />
               ))}

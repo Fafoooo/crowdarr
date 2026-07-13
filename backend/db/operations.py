@@ -15,6 +15,9 @@ import aiosqlite
 
 _BUSY_TIMEOUT_MS = 5_000
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_COUNTER_NAMES = ("fetched", "matches", "misses", "repaired", "uploaded")
+_COUNTER_SEMANTICS_KEY = "counter_semantics"
+_COUNTER_SEMANTICS_VERSION = "2"
 
 
 def _utc_now() -> datetime:
@@ -97,6 +100,11 @@ class OperationsStore:
                     value INTEGER NOT NULL CHECK (value >= 0)
                 );
 
+                CREATE TABLE IF NOT EXISTS operation_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
                     kind TEXT NOT NULL,
@@ -124,6 +132,7 @@ class OperationsStore:
                 CREATE INDEX IF NOT EXISTS ix_file_hash_cache_updated_at
                     ON file_hash_cache(updated_at DESC);
                 """)
+            await self._migrate_counter_semantics_unlocked(connection)
             now = _utc_now().isoformat()
             await connection.execute(
                 """
@@ -146,6 +155,95 @@ class OperationsStore:
         finally:
             await connection.close()
         self._initialized = True
+
+    @staticmethod
+    async def _migrate_counter_semantics_unlocked(
+        connection: aiosqlite.Connection,
+    ) -> None:
+        cursor = await connection.execute(
+            "SELECT value FROM operation_metadata WHERE key = ?",
+            (_COUNTER_SEMANTICS_KEY,),
+        )
+        version = await cursor.fetchone()
+        await cursor.close()
+        if version is not None and str(version[0]) == _COUNTER_SEMANTICS_VERSION:
+            return
+
+        cursor = await connection.execute(
+            "SELECT event_type, message, details FROM activity ORDER BY id"
+        )
+        activity_rows = await cursor.fetchall()
+        await cursor.close()
+        cursor = await connection.execute("SELECT name, value FROM counters")
+        counter_rows = await cursor.fetchall()
+        await cursor.close()
+
+        if activity_rows:
+            derived = {name: 0 for name in _COUNTER_NAMES}
+            repair_fetch_titles = {
+                "torrent repaired",
+                "torrent nfo verified",
+                "nfo placed; recheck disabled",
+                "nfo verified; torrent incomplete",
+                "nfo verified; seeding not confirmed",
+            }
+            verification_failures = {"nfo mismatch", "verification timed out"}
+            for event_type, message, raw_details in activity_rows:
+                try:
+                    details = _load_json(str(raw_details))
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    details = {}
+                event = str(event_type).casefold()
+                status = str(details.get("status", "")).casefold()
+                title = str(details.get("title", "")).casefold()
+                detail = str(message).casefold()
+
+                if event == "miss":
+                    if detail in verification_failures:
+                        derived["fetched"] += 1
+                        derived["matches"] += 1
+                    else:
+                        derived["misses"] += 1
+                    continue
+                if event == "repair":
+                    if title in repair_fetch_titles:
+                        derived["fetched"] += 1
+                        derived["matches"] += 1
+                    if title == "torrent repaired" and status == "success":
+                        derived["repaired"] += 1
+                    continue
+                if event in {"library_fetch", "sab_fetch", "qbit_fetch"}:
+                    if status == "success":
+                        derived["fetched"] += 1
+                        derived["matches"] += 1
+                    continue
+                if (
+                    event in {"sab_contribute", "qbit_contribute"}
+                    and status == "success"
+                ):
+                    derived["uploaded"] += 1
+
+            existing = {str(name): int(value) for name, value in counter_rows}
+            corrected = {
+                name: max(existing.get(name, 0), derived[name])
+                for name in _COUNTER_NAMES
+            }
+            corrected["misses"] = derived["misses"]
+            await connection.executemany(
+                """
+                INSERT INTO counters(name, value) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET value = excluded.value
+                """,
+                tuple(corrected.items()),
+            )
+
+        await connection.execute(
+            """
+            INSERT INTO operation_metadata(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (_COUNTER_SEMANTICS_KEY, _COUNTER_SEMANTICS_VERSION),
+        )
 
     async def initialize(self) -> None:
         async with self._lock:

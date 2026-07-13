@@ -231,14 +231,20 @@ class SettingsStore:
             else:
                 current[key] = value
 
+    @classmethod
+    def apply_patch(cls, current: AppSettings, patch: SettingsPatch) -> AppSettings:
+        """Return a validated settings preview without persisting it."""
+
+        current_data = current.model_dump(mode="python")
+        patch_data = patch.model_dump(exclude_unset=True, mode="python")
+        cls._drop_blank_secrets(patch_data)
+        cls._merge(current_data, patch_data)
+        return AppSettings.model_validate(current_data)
+
     async def update(self, patch: SettingsPatch) -> AppSettings:
         async with self._lock:
             current = await self._read_unlocked()
-            current_data = current.model_dump(mode="python")
-            patch_data = patch.model_dump(exclude_unset=True, mode="python")
-            self._drop_blank_secrets(patch_data)
-            self._merge(current_data, patch_data)
-            updated = AppSettings.model_validate(current_data)
+            updated = self.apply_patch(current, patch)
             connection = await self._connect()
             try:
                 await connection.execute(

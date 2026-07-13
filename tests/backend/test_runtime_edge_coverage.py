@@ -293,12 +293,26 @@ class PollQBit:
 class CompletionMemory:
     def __init__(self) -> None:
         self.completed: set[str] = set()
+        self.counters: dict[str, int] = {}
+        self.activities: list[tuple[str, str, dict[str, object]]] = []
 
     async def was_completed(self, key: str) -> bool:
         return key in self.completed
 
     async def mark_completed(self, key: str) -> None:
         self.completed.add(key)
+
+    async def increment_counter(self, name: str, amount: int = 1) -> None:
+        self.counters[name] = self.counters.get(name, 0) + amount
+
+    async def record_activity(
+        self,
+        *,
+        event_type: str,
+        message: str,
+        details: dict[str, object],
+    ) -> None:
+        self.activities.append((event_type, message, details))
 
 
 class PollLiveService:
@@ -354,6 +368,22 @@ async def test_qbit_completion_poller_filters_retries_and_marks_success() -> Non
     live.fail_contribution = False
     await poller.poll_once()
     assert "qbit-completion:new" in store.completed
+    assert live.calls == [
+        ("fetch", "new"),
+        ("contribute", "new"),
+        ("contribute", "new"),
+    ]
+    assert store.counters == {"fetched": 1, "matches": 1, "uploaded": 1}
+    assert [event_type for event_type, _, _ in store.activities] == [
+        "qbit_fetch",
+        "qbit_contribute",
+        "qbit_contribute",
+    ]
+    assert [details["status"] for _, _, details in store.activities] == [
+        "success",
+        "warning",
+        "success",
+    ]
     poller.start()
     poller.start()
     await asyncio.sleep(0)

@@ -60,6 +60,45 @@ function normaliseDashboard(raw: unknown): DashboardData {
           status,
         };
       });
+  const stuckTorrents = Array.isArray(value.stuck_torrents)
+    ? value.stuck_torrents.flatMap((item) => {
+        if (!isRecord(item)) return [];
+        const missingNfoPath =
+          typeof item.missing_nfo_path === "string"
+            ? item.missing_nfo_path
+            : "";
+        const repairable =
+          typeof item.repairable === "boolean"
+            ? item.repairable
+            : missingNfoPath.length > 0;
+        return [
+          {
+            category:
+              typeof item.category === "string"
+                ? item.category
+                : "uncategorized",
+            hash: typeof item.hash === "string" ? item.hash : "",
+            missing_nfo_count:
+              typeof item.missing_nfo_count === "number"
+                ? item.missing_nfo_count
+                : missingNfoPath
+                  ? 1
+                  : 0,
+            missing_nfo_path: missingNfoPath,
+            name: typeof item.name === "string" ? item.name : "Unknown torrent",
+            progress: typeof item.progress === "number" ? item.progress : 0,
+            reason:
+              typeof item.reason === "string"
+                ? (item.reason as DashboardData["stuck_torrents"][number]["reason"])
+                : repairable
+                  ? "ready"
+                  : "inspection_failed",
+            repairable,
+            state: typeof item.state === "string" ? item.state : "unknown",
+          },
+        ];
+      })
+    : [];
 
   return {
     connectors,
@@ -74,9 +113,7 @@ function normaliseDashboard(raw: unknown): DashboardData {
     recent_activity: Array.isArray(value.recent_activity)
       ? (value.recent_activity as DashboardData["recent_activity"])
       : [],
-    stuck_torrents: Array.isArray(value.stuck_torrents)
-      ? (value.stuck_torrents as DashboardData["stuck_torrents"])
-      : [],
+    stuck_torrents: stuckTorrents,
   };
 }
 
@@ -116,12 +153,24 @@ function ConnectorCard({ connector }: { connector: ConnectorHealth }) {
 }
 
 const metricLabels = [
-  ["Fetched", "fetched"],
-  ["Torrents repaired", "repaired"],
-  ["Uploaded", "uploaded"],
-  ["Matches", "matches"],
-  ["Misses", "misses"],
+  ["NFOs fetched", "fetched", "Downloaded from CrowdNFO"],
+  ["Torrents repaired", "repaired", "Verified complete and seeding"],
+  ["Uploads completed", "uploaded", "Contributions accepted"],
+  ["CrowdNFO matches", "matches", "Lookups that returned an NFO"],
+  ["CrowdNFO misses", "misses", "Lookups without a usable NFO"],
 ] as const;
+
+const reasonLabels: Record<
+  DashboardData["stuck_torrents"][number]["reason"],
+  string
+> = {
+  inspection_failed: "File list could not be inspected",
+  invalid_nfo_path: "NFO path is unsafe or invalid",
+  no_incomplete_nfo: "No incomplete NFO detected",
+  no_video: "No video payload detected",
+  ready: "NFO-only repair ready",
+  video_incomplete: "Video data is below 99%",
+};
 
 const JOB_POLL_INTERVAL_MS = 1_000;
 const JOB_POLL_ATTEMPTS = 310;
@@ -157,6 +206,8 @@ export default function DashboardPage() {
   const repairIsRunning =
     pendingAction?.startsWith("repair-") &&
     actionMessage === "Repair is running…";
+  const repairableTorrents =
+    data?.stuck_torrents.filter((torrent) => torrent.repairable).length ?? 0;
 
   const loadDashboard = useCallback(async () => {
     setLoadError(undefined);
@@ -297,7 +348,7 @@ export default function DashboardPage() {
             aria-label="Lifetime counters"
             className="grid grid-cols-2 overflow-hidden rounded-2xl border border-white/[0.07] bg-zinc-900/70 shadow-panel sm:grid-cols-3 xl:grid-cols-5"
           >
-            {metricLabels.map(([label, key]) => (
+            {metricLabels.map(([label, key, description]) => (
               <div
                 aria-label={label}
                 className="border-b border-r border-white/[0.06] px-5 py-5 last:border-r-0 sm:py-6"
@@ -310,29 +361,42 @@ export default function DashboardPage() {
                 <p className="mt-1 text-xs font-medium text-zinc-500">
                   {label}
                 </p>
+                <p className="mt-1 text-[10px] leading-4 text-zinc-700">
+                  {description}
+                </p>
               </div>
             ))}
           </section>
 
-          <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(440px,0.85fr)]">
+          <div className="space-y-6">
             <Panel
-              description="Items that need a byte-exact NFO before qBittorrent can finish."
-              title="Stuck torrents"
+              description="Every incomplete qBittorrent download, with the exact reason it is or is not ready for NFO repair."
+              title="Incomplete qBittorrent torrents"
             >
-              <section aria-label="Stuck torrents" className="overflow-x-auto">
+              <section
+                aria-label="Incomplete qBittorrent torrents"
+                className="overflow-x-auto"
+              >
+                <p className="border-b border-white/[0.05] px-5 py-3 text-xs text-zinc-500">
+                  {repairableTorrents.toLocaleString()} repairable ·{" "}
+                  {data.stuck_torrents.length.toLocaleString()} incomplete
+                </p>
                 {data.stuck_torrents.length === 0 ? (
                   <p className="px-5 py-10 text-center text-sm text-zinc-500">
-                    No torrents are currently waiting on an NFO.
+                    No incomplete qBittorrent downloads were found.
                   </p>
                 ) : (
-                  <table className="w-full min-w-[620px] text-left text-sm">
+                  <table className="w-full min-w-[700px] text-left text-sm">
                     <thead className="bg-white/[0.02] text-[11px] uppercase tracking-wider text-zinc-600">
                       <tr>
                         <th className="px-5 py-3 font-medium" scope="col">
                           Release
                         </th>
                         <th className="px-4 py-3 font-medium" scope="col">
-                          Missing file
+                          Status
+                        </th>
+                        <th className="px-4 py-3 font-medium" scope="col">
+                          NFO
                         </th>
                         <th className="px-4 py-3 font-medium" scope="col">
                           Progress
@@ -360,30 +424,57 @@ export default function DashboardPage() {
                             </p>
                           </td>
                           <td className="max-w-64 px-4 py-4 text-xs text-zinc-400">
-                            <span className="block truncate">
-                              {torrent.missing_nfo_path}
+                            <span className="block font-medium text-zinc-300">
+                              {torrent.state}
                             </span>
+                            <span className="mt-1 block text-zinc-600">
+                              {reasonLabels[torrent.reason] ?? torrent.reason}
+                            </span>
+                          </td>
+                          <td className="max-w-64 px-4 py-4 text-xs text-zinc-400">
+                            {torrent.missing_nfo_count > 1 ? (
+                              <>
+                                <span className="block font-medium text-zinc-300">
+                                  {torrent.missing_nfo_count} NFO files
+                                </span>
+                                <span className="mt-1 block truncate text-zinc-600">
+                                  {torrent.missing_nfo_path}
+                                </span>
+                              </>
+                            ) : torrent.missing_nfo_path ? (
+                              <span className="block truncate">
+                                {torrent.missing_nfo_path}
+                              </span>
+                            ) : (
+                              <span className="text-zinc-700">—</span>
+                            )}
                           </td>
                           <td className="px-4 py-4 font-mono text-xs text-amber-300">
                             {(torrent.progress * 100).toFixed(1)}%
                           </td>
                           <td className="px-5 py-4 text-right">
-                            <Button
-                              aria-label={`${data.dry_run ? "Simulate repair" : "Repair"} ${torrent.name}`}
-                              disabled={
-                                pendingAction === `repair-${torrent.hash}`
-                              }
-                              onClick={() =>
-                                void runAction(
-                                  `repair-${torrent.hash}`,
-                                  `/api/torrents/${encodeURIComponent(torrent.hash)}/repair`,
-                                )
-                              }
-                              type="button"
-                            >
-                              <RepairIcon className="size-4" />
-                              {data.dry_run ? "Simulate repair" : "Repair"}
-                            </Button>
+                            {torrent.repairable ? (
+                              <Button
+                                aria-label={`${data.dry_run ? "Simulate repair" : "Repair"} ${torrent.name}`}
+                                disabled={
+                                  pendingAction === `repair-${torrent.hash}`
+                                }
+                                onClick={() =>
+                                  void runAction(
+                                    `repair-${torrent.hash}`,
+                                    `/api/torrents/${encodeURIComponent(torrent.hash)}/repair`,
+                                  )
+                                }
+                                type="button"
+                              >
+                                <RepairIcon className="size-4" />
+                                {data.dry_run ? "Simulate repair" : "Repair"}
+                              </Button>
+                            ) : (
+                              <span className="text-xs text-zinc-600">
+                                Not NFO-only
+                              </span>
+                            )}
                           </td>
                         </tr>
                       ))}

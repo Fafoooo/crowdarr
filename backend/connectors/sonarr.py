@@ -32,7 +32,7 @@ class SonarrConnector:
         base_url: str,
         api_key: str | Any,
         http_client: httpx.AsyncClient | None = None,
-        path_mapper: PathMapper,
+        path_mapper: PathMapper | None = None,
         timeout: float = 30.0,
     ) -> None:
         self._base_url = normalize_base_url(base_url, service="Sonarr")
@@ -48,6 +48,8 @@ class SonarrConnector:
         return {"X-Api-Key": cast(str, self._api_key)}
 
     async def list_media(self) -> list[LibraryMediaItem]:
+        if self._path_mapper is None:
+            raise ValueError("Sonarr path mapping is required for library scans")
         response = await self._http.get(
             f"{self._base_url}/api/v3/series",
             headers=self._headers,
