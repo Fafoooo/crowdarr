@@ -265,6 +265,44 @@ async def test_sab_runtime_does_not_count_noop_or_persist_dry_run_completion() -
     assert dry_store.completed == set()
 
 
+class PartialContributionWebhook:
+    async def handle(self, _event: SABCompletionEvent) -> SABWebhookResult:
+        return SABWebhookResult(
+            accepted=True,
+            actions=("contribute",),
+            performed_actions=("contribute",),
+            warnings={"contribute": "MediaInfo upload failed"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_sab_runtime_counts_and_warns_for_partial_contribution() -> None:
+    event = SABCompletionEvent(**sab_payload())
+    store = RecordingRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=AppSettings(
+            download_mode=DownloadMode.OFF,
+            dry_run=False,
+            contribute={"enabled": True},
+            sabnzbd=ConnectorSettings(
+                enabled=True,
+                base_url="http://sabnzbd:8080",
+            ),
+        ),
+        store=store,
+        sab_webhook=PartialContributionWebhook(),
+        sab_history=FakeSABHistory(event),
+    )
+
+    outcome = await runtime.handle_sab_completion(event)
+
+    assert outcome.status == "partial"
+    assert store.counters["uploaded"] == 1
+    assert store.activities[-1]["status"] == "warning"
+    assert "MediaInfo upload failed" in str(store.activities[-1]["message"])
+    assert store.completed
+
+
 class BlockingQueuedRuntime:
     def __init__(self) -> None:
         self.started = asyncio.Event()

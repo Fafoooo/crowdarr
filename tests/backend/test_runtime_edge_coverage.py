@@ -9,6 +9,10 @@ import pytest
 import backend.runtime as runtime_module
 from backend.connectors.qbit import TorrentSnapshot
 from backend.connectors.sab import SABCompletionEvent, SABLiveActionResult
+from backend.core.contribution import (
+    ContributionComponentResult,
+    ContributionResult,
+)
 from backend.core.files import WriteDisposition, WriteResult
 from backend.core.hashing import HashResult
 from backend.core.settings import (
@@ -166,12 +170,13 @@ class RecordingHasher:
 
 
 class RecordingContribution:
-    def __init__(self) -> None:
+    def __init__(self, result: object = "uploaded") -> None:
         self.calls: list[tuple[Any, dict[str, bool]]] = []
+        self.result = result
 
-    async def contribute(self, item: Any, **options: bool) -> str:
+    async def contribute(self, item: Any, **options: bool) -> object:
         self.calls.append((item, options))
-        return "uploaded"
+        return self.result
 
 
 def live_settings(root: Path, *, dry_run: bool = False) -> AppSettings:
@@ -279,6 +284,37 @@ async def test_sab_live_workflow_handles_dry_run_missing_media_and_hash_modes(
     )
     with pytest.raises(LookupError, match="too large"):
         await workflow.fetch_missing(event)
+
+
+@pytest.mark.asyncio
+async def test_sab_live_workflow_reports_partial_contribution_as_performed(
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "Partial-GROUP"
+    release.mkdir()
+    (release / "Partial.mkv").write_bytes(b"video")
+    partial = ContributionResult(
+        status="partial",
+        components={
+            "nfo": ContributionComponentResult("success"),
+            "mediainfo": ContributionComponentResult("failed", "inspection failed"),
+        },
+    )
+    workflow = SABLiveWorkflow(
+        settings=live_settings(tmp_path),
+        path_mapper=FixedPathMapper(release),
+        crowdnfo=RecordingDownloader(),
+        contribution=RecordingContribution(partial),
+    )
+
+    result = await workflow.contribute(
+        SABCompletionEvent("Partial-GROUP", "/data/Partial-GROUP")
+    )
+
+    assert result.performed is True
+    assert result.terminal is True
+    assert result.warning is not None
+    assert "mediainfo" in result.warning
 
 
 def completed_torrent(
@@ -463,6 +499,43 @@ async def test_qbit_completion_poller_does_not_count_noop_live_actions() -> None
         "qbit-completion:noop:fetch",
         "qbit-completion:noop:contribute",
     }.issubset(store.completed)
+    await poller.close()
+
+
+class PartialPollLiveService(PollLiveService):
+    async def contribute(self, torrent: TorrentSnapshot) -> SABLiveActionResult:
+        self.calls.append(("contribute", torrent.torrent_hash))
+        return SABLiveActionResult(
+            performed=True,
+            terminal=True,
+            warning="MediaInfo upload failed",
+        )
+
+
+@pytest.mark.asyncio
+async def test_qbit_completion_poller_counts_partial_contribution_once() -> None:
+    store = CompletionMemory()
+    live = PartialPollLiveService(fetch_performed=False)
+    poller = QBitCompletedPoller(
+        qbit=PollQBit([completed_torrent("partial")]),
+        live_service=live,
+        store=store,
+        fetch_enabled=False,
+        contribute_enabled=True,
+        poll_interval=0.01,
+    )
+
+    first = await poller.poll_once()
+    second = await poller.poll_once()
+
+    assert first["partial"].performed_actions == ("contribute",)
+    assert first["partial"].warnings == {
+        "contribute": "MediaInfo upload failed",
+    }
+    assert second == {}
+    assert store.counters == {"uploaded": 1}
+    assert "qbit-completion:partial" in store.completed
+    assert store.activities[-1][2]["status"] == "warning"
     await poller.close()
 
 

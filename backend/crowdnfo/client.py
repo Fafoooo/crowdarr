@@ -112,7 +112,7 @@ class CrowdNFOClient:
             if self._last_request_started is not None:
                 delay = self._request_interval - (now - self._last_request_started)
                 if delay > 0:
-                    await asyncio.sleep(delay)
+                    await self._sleep(delay)
             self._last_request_started = self._monotonic()
 
     @staticmethod

@@ -480,7 +480,11 @@ class _OutcomeLiveService:
         return SABLiveActionResult(performed=False, value=Path("existing.nfo"))
 
     async def contribute(self, _event: SABCompletionEvent) -> SABLiveActionResult:
-        return SABLiveActionResult(performed=True, value=object())
+        return SABLiveActionResult(
+            performed=True,
+            value=object(),
+            warning="MediaInfo upload failed",
+        )
 
 
 @pytest.mark.asyncio
@@ -495,6 +499,7 @@ async def test_sab_webhook_distinguishes_noop_from_performed_actions() -> None:
 
     assert result.actions == ("fetch", "contribute")
     assert result.performed_actions == ("contribute",)
+    assert result.warnings == {"contribute": "MediaInfo upload failed"}
 
 
 @pytest.mark.asyncio
@@ -822,6 +827,7 @@ async def test_crowdnfo_retries_gets_with_retry_after_and_exponential_backoff() 
             base_url="https://crowdnfo.test",
             http_client=http,
             max_retries=2,
+            request_interval=0,
             sleep=record_sleep,
         )
         metadata = await client.lookup(release_name="Release")
