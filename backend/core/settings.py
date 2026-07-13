@@ -16,6 +16,8 @@ from pydantic import (
     field_validator,
 )
 
+from backend.core.files import MismatchCleanupPolicy
+
 
 def _empty_secret() -> SecretStr:
     return SecretStr("")
@@ -101,6 +103,7 @@ class AppSettings(StrictModel):
     umlautadaptarr: ConnectorSettings = Field(default_factory=ConnectorSettings)
     download_mode: DownloadMode = DownloadMode.OFF
     auto_recheck: bool = True
+    nfo_mismatch_policy: MismatchCleanupPolicy = MismatchCleanupPolicy.KEEP
     contribute: ContributionSettings = Field(default_factory=ContributionSettings)
     match_strategy: Literal[
         "hash_then_release_name", "hash_only", "release_name_only"
@@ -127,6 +130,7 @@ class SettingsPatch(StrictModel):
     umlautadaptarr: ConnectorPatch | None = None
     download_mode: DownloadMode | None = None
     auto_recheck: bool | None = None
+    nfo_mismatch_policy: MismatchCleanupPolicy | None = None
     contribute: ContributionPatch | None = None
     match_strategy: (
         Literal["hash_then_release_name", "hash_only", "release_name_only"] | None

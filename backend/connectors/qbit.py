@@ -257,11 +257,21 @@ class QBitConnector:
         )
 
     async def resume(self, torrent_hash: str) -> None:
-        await self._request(
-            "POST",
-            "/api/v2/torrents/resume",
-            data={"hashes": torrent_hash},
-        )
+        data = {"hashes": torrent_hash}
+        try:
+            await self._request(
+                "POST",
+                "/api/v2/torrents/start",
+                data=data,
+            )
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code not in {404, 405}:
+                raise
+            await self._request(
+                "POST",
+                "/api/v2/torrents/resume",
+                data=data,
+            )
 
     async def healthcheck(self) -> ConnectorHealth:
         from backend.connectors.health import ConnectorHealth
