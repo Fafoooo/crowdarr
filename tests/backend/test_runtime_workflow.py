@@ -295,6 +295,29 @@ class FakeRepairService:
         return result
 
 
+class BatchRepairService:
+    def __init__(self, target_root: Path) -> None:
+        self.target_root = target_root
+        self.batches: list[list[MissingNFO]] = []
+
+    async def repair(self, candidate: MissingNFO) -> RepairResult:
+        raise AssertionError(f"runtime repaired candidate individually: {candidate}")
+
+    async def repair_many(
+        self, candidates: list[MissingNFO]
+    ) -> list[RepairResult]:
+        self.batches.append(list(candidates))
+        return [
+            RepairResult(
+                status=RepairStatus.SUCCESS,
+                target_path=self.target_root / candidate.relative_path.name,
+                verified=True,
+                seeding=True,
+            )
+            for candidate in candidates
+        ]
+
+
 class FakeLibraryConnector:
     def __init__(
         self,
@@ -483,6 +506,41 @@ async def test_per_torrent_repair_targets_only_the_requested_hash(
     assert [candidate.torrent_hash for candidate in repair.calls] == ["second"]
     assert ("list_torrents",) not in qbit.calls
     assert qbit.calls[:1] == [("get_torrent", "second")]
+    assert store.counters["repaired"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_batches_missing_nfos_and_counts_one_repaired_torrent(
+    tmp_path: Path,
+) -> None:
+    snapshot = torrent_snapshot("batch", "Release.Batch-GROUP")
+    files = torrent_files(snapshot.name)
+    files.insert(
+        1,
+        TorrentFile(
+            index=9,
+            path=f"{snapshot.name}/{snapshot.name}.proof.nfo",
+            size=4_096,
+            progress=0.0,
+            priority=0,
+        ),
+    )
+    repair = BatchRepairService(tmp_path)
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=FakeQBit([snapshot], {snapshot.torrent_hash: files}),
+        repair_service=repair,
+    )
+
+    outcome = await runtime.scan_and_repair()
+
+    assert outcome.status == "success"
+    assert len(repair.batches) == 1
+    assert [candidate.file_index for candidate in repair.batches[0]] == [7, 9]
+    assert store.counters["fetched"] == 2
+    assert store.counters["matches"] == 2
     assert store.counters["repaired"] == 1
 
 

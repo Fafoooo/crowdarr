@@ -268,6 +268,55 @@ async def test_qbit_repair_hashes_video_and_prefers_hash_lookup(tmp_path: Path) 
     assert crowdnfo.downloads == [(snapshot.name, DIGEST)]
 
 
+@pytest.mark.asyncio
+async def test_qbit_repair_never_hashes_an_incomplete_video(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    release_root = data_root / "release"
+    release_root.mkdir(parents=True)
+    media = release_root / "Movie.mkv"
+    media.write_bytes(b"incomplete-media-payload")
+    snapshot = TorrentSnapshot(
+        torrent_hash="torrent-hash",
+        name="Movie.2026-GROUP",
+        category="movies",
+        content_path="/data/release",
+        progress=0.999,
+        state="stalledDL",
+        files=[
+            TorrentFile(0, "Movie.mkv", media.stat().st_size, 0.9999, 1),
+            TorrentFile(1, "Movie.nfo", 20, 0.0, 1),
+        ],
+        local_content_path=release_root,
+    )
+    crowdnfo = RecordingCrowdNFO()
+    hasher = RecordingHashService()
+    mapper = PathMapper(
+        mappings=[PathMapping(remote_root="/data", local_root=data_root)],
+        allowed_roots=[data_root],
+    )
+    service = TorrentRepairService(
+        crowdnfo=crowdnfo,
+        qbit=RepairQBit(snapshot),
+        path_mapper=mapper,
+        allowed_roots=[data_root],
+        hash_service=hasher,
+        auto_recheck=False,
+    )
+    candidate = MissingNFO(
+        torrent_hash=snapshot.torrent_hash,
+        torrent_name=snapshot.name,
+        file_index=1,
+        relative_path=PurePosixPath("Movie.nfo"),
+        reported_path=PurePosixPath("/data/release/Movie.nfo"),
+    )
+
+    result = await service.repair(candidate)
+
+    assert result.status is RepairStatus.PLACED_UNVERIFIED
+    assert hasher.paths == []
+    assert crowdnfo.downloads == [(snapshot.name, None)]
+
+
 class RuntimeStore:
     def __init__(self) -> None:
         self.counters: Counter[str] = Counter()

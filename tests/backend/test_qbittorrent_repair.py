@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -63,13 +64,13 @@ def test_detects_incomplete_nfo_only_when_video_is_nearly_complete() -> None:
     )
 
 
-def test_multifile_paths_are_rooted_at_qbittorrent_save_path() -> None:
+def test_multifile_paths_follow_qbittorrent_actual_incomplete_content_path() -> None:
     torrent = TorrentSnapshot(
         torrent_hash="deadbeef",
         name="Release.Name.2026-GROUP",
         category="cross-seed-link",
-        save_path="/data/cross-seeds",
-        content_path="/data/cross-seeds/Release.Name",
+        save_path="/data/completed",
+        content_path="/data/incomplete/Release.Name",
         progress=0.999,
         state="stalledDL",
         files=[
@@ -93,7 +94,7 @@ def test_multifile_paths_are_rooted_at_qbittorrent_save_path() -> None:
     missing = find_stuck_nfos(torrent)
 
     assert missing[0].reported_path == PurePosixPath(
-        "/data/cross-seeds/Release.Name/Release.Name.nfo"
+        "/data/incomplete/Release.Name/Release.Name.nfo"
     )
 
 
@@ -341,6 +342,83 @@ async def test_repair_polls_after_resume_until_torrent_is_seeding(
     assert result.seeding is True
     assert [event[0] for event in events].count("poll") == 4
     assert clock.value >= 2.0
+
+
+@pytest.mark.asyncio
+async def test_queued_upload_is_not_reported_as_active_seeding(tmp_path: Path) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    queued = make_snapshot(
+        torrent_progress=1.0,
+        nfo_progress=1.0,
+        state="queuedUP",
+    )
+    qbit = FakeQBit(
+        [checking_snapshot(), checked_snapshot(matched=True), seeding_snapshot()],
+        events,
+        resumed_state=queued,
+    )
+    service = make_service(
+        local_data=tmp_path / "data",
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(b"exact nfo", events),
+        writer=RecordingWriter(events),
+        clock=clock,
+        recheck_timeout=5.0,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert result.status is RepairStatus.SUCCESS
+    assert [event[0] for event in events].count("poll") == 3
+
+
+@pytest.mark.asyncio
+async def test_multiple_missing_nfos_are_written_before_one_recheck(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    first = TorrentFile(7, "Release.Name/first.nfo", 100, 0.0, 0)
+    second = TorrentFile(9, "Release.Name/second.nfo", 100, 0.0, 0)
+    video = TorrentFile(
+        8,
+        "Release.Name/Release.Name.mkv",
+        VIDEO_SIZE,
+        1.0,
+        1,
+    )
+    stuck = replace(make_snapshot(), files=[first, second, video])
+    checking = replace(stuck, state="checkingUP")
+    verified_files = [
+        replace(first, progress=1.0),
+        replace(second, progress=1.0),
+        video,
+    ]
+    verified = replace(
+        stuck,
+        progress=1.0,
+        state="stoppedUP",
+        files=verified_files,
+    )
+    seeding = replace(verified, state="uploading")
+    qbit = FakeQBit([checking, verified], events, resumed_state=seeding)
+    service = make_service(
+        local_data=tmp_path / "data",
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(b"exact nfo", events),
+        writer=RecordingWriter(events),
+        clock=FakeClock(),
+    )
+
+    results = await service.repair_many(find_stuck_nfos(stuck))
+
+    assert [result.status for result in results] == [
+        RepairStatus.SUCCESS,
+        RepairStatus.SUCCESS,
+    ]
+    assert [event[0] for event in events].count("recheck") == 1
+    assert [event[0] for event in events].count("resume") == 1
+    assert ("priority", "deadbeef", [7, 9], 1) in events
 
 
 @pytest.mark.asyncio
