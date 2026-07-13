@@ -44,6 +44,7 @@ ruff check .
 black --check .
 mypy backend
 pytest --cov=backend --cov-report=term-missing
+pip-audit
 
 cd frontend
 npm run lint
@@ -90,5 +91,6 @@ it is enabled instead of opening a public exploit report.
 ## Releases
 
 Version tags use `vMAJOR.MINOR.PATCH`. Pushing a matching tag creates release
-notes and publishes multi-architecture GHCR images. Maintainers should update
-`CHANGELOG.md` before tagging and verify CI on the exact commit.
+notes and publishes multi-architecture GHCR images only after the reusable full
+CI workflow succeeds for that tag. Maintainers should update `CHANGELOG.md`
+before tagging and verify CI on the exact commit.

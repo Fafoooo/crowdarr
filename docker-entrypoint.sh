@@ -33,16 +33,8 @@ case "$UMASK" in
   *) fail "UMASK must be a three- or four-digit octal value" ;;
 esac
 [ -n "$CROWDARRR_DATA_DIR" ] || fail "CROWDARRR_DATA_DIR cannot be empty"
-[ "$CROWDARRR_DATA_DIR" != "/" ] || fail "CROWDARRR_DATA_DIR cannot be /"
-case "$CROWDARRR_DATA_DIR" in
-  /*) ;;
-  *) fail "CROWDARRR_DATA_DIR must be an absolute path" ;;
-esac
-case "$CROWDARRR_DATA_DIR" in
-  /app|/app/*|/bin|/bin/*|/boot|/boot/*|/data|/data/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|/opt|/opt/*|/proc|/proc/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|/usr|/usr/*)
-    fail "CROWDARRR_DATA_DIR points at a protected runtime or media path"
-    ;;
-esac
+[ "$CROWDARRR_DATA_DIR" = "/config" ] \
+  || fail "CROWDARRR_DATA_DIR is fixed at /config in the container; change the host bind source instead"
 
 export CROWDARRR_DATA_DIR CROWDARRR_HOST CROWDARRR_PORT CROWDARRR_LOG_LEVEL
 
@@ -62,8 +54,24 @@ if [ "$(id -u)" -eq 0 ]; then
     fail "CROWDARRR_DATA_DIR appears to contain a mounted host root"
   fi
   chown --no-dereference "$PUID:$PGID" "$CROWDARRR_DATA_DIR"
-  find "$CROWDARRR_DATA_DIR" -xdev -mindepth 1 \
-    -exec chown --no-dereference "$PUID:$PGID" {} +
+  for state_name in \
+    crowdarrr.sqlite3 \
+    crowdarrr.sqlite3-journal \
+    crowdarrr.sqlite3-shm \
+    crowdarrr.sqlite3-wal \
+    crowdarrr.sqlite3.key
+  do
+    state_path="$CROWDARRR_DATA_DIR/$state_name"
+    [ ! -L "$state_path" ] \
+      || fail "$state_path must not be a symlink"
+    if [ -e "$state_path" ]; then
+      [ -f "$state_path" ] \
+        || fail "$state_path must be a regular file"
+      [ "$(stat --format='%h' "$state_path")" -eq 1 ] \
+        || fail "$state_path must not be hard-linked"
+      chown --no-dereference "$PUID:$PGID" "$state_path"
+    fi
+  done
   export HOME="$CROWDARRR_DATA_DIR"
 else
   mkdir -p "$CROWDARRR_DATA_DIR" 2>/dev/null \

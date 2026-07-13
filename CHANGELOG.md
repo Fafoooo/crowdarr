@@ -16,6 +16,17 @@ All notable changes to this project are documented here. The format follows
 - Generic Compose deployment and opt-in LXC/macvlan reference profile.
 - CI, multi-architecture GHCR publishing, GitHub releases, and Dependabot.
 
+### Security
+
+- Gate image and GitHub release publication on the reusable full CI workflow,
+  including Python dependency auditing.
+- Require a dedicated SABnzbd webhook secret, enforce a payload-size limit, and
+  bound background action, hashing, polling, and health-check work.
+- Remove recursive ownership changes from container startup and restrict
+  automatic ownership repair to known state files under `/config`.
+- Raise vulnerable `cryptography`, Black, and pytest dependency ranges to fixed
+  releases.
+
 ### Known gaps
 
 - CrowdNFO currently has no documented hash-only download lookup.

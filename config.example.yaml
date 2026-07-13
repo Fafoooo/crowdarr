@@ -42,6 +42,7 @@ umlautadaptarr:
 
 download_mode: new_and_backfill
 auto_recheck: true
+nfo_mismatch_policy: keep
 contribute:
   enabled: false
   nfo: true
@@ -57,4 +58,10 @@ category_mappings:
   sonarr: TV
 backfill_cron: "0 3 * * *"
 dry_run: true
-application_api_token: ""
+
+# Protect /api with CROWDARRR_API_TOKEN in the process environment. Runtime API
+# authentication is deliberately not activated by a value in this UI schema.
+# The optional SAB webhook likewise uses CROWDARRR_SAB_WEBHOOK_SECRET from the
+# environment, never a connector API key.
+# Queue, hashing, polling, webhook-size, and health-check bounds are also runtime
+# environment settings; see .env.example for their documented defaults.

@@ -17,8 +17,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  quality-gate:
+    name: Required CI
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: Publish multi-architecture image
+    needs: quality-gate
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

@@ -52,7 +52,9 @@ TZ=Europe/Vienna
 
 Use the UID and GID that own the host media files. The process drops privileges
 to those IDs before FastAPI starts. On startup it owns only the configuration
-directory; it does not recursively change ownership below `/data`.
+directory and known SQLite state files; it does not recursively change ownership
+below `/config` or `/data`. The container path is intentionally fixed at
+`/config`; customize only the `CROWDARRR_CONFIG_ROOT` host-side bind source.
 
 To use a published image instead of a local build, set
 `CROWDARRR_IMAGE=ghcr.io/<owner>/crowdarrr:latest`. Compose retains the `build`
@@ -99,6 +101,14 @@ UmlautAdaptarr title recovery are important fallbacks. Library sidecars do not
 need torrent-piece byte identity, but Crowdarrr still preserves the response
 bytes and never overwrites a non-empty existing NFO.
 
+The optional SABnzbd completion endpoint is `POST /api/webhooks/sabnzbd`. It is
+disabled until `CROWDARRR_SAB_WEBHOOK_SECRET` is set and requires that value in
+the `X-Crowdarrr-SAB-Secret` header. Send JSON containing `release_name` (or
+`name`), `storage_path` (or `storage`), `category`, and SAB's `nzo_id`.
+Crowdarrr verifies the ID and path against SAB history before processing it,
+deduplicates completed events, and rejects bodies above
+`CROWDARRR_SAB_WEBHOOK_MAX_BYTES` (64 KiB by default).
+
 ## Operating modes
 
 `download_mode` has three values:
@@ -110,6 +120,15 @@ bytes and never overwrites a non-empty existing NFO.
 Contribution is independently disabled by default. NFO, MediaInfo, and file-list
 uploads can each be selected. Hashing is streamed with a size limit and bounded
 concurrency; the `(path, size, mtime) -> SHA-256` result is cached in SQLite.
+
+Runtime work is bounded independently from UI settings. The defaults are two
+concurrent actions with 64 waiting jobs, two concurrent hashes, a 30-second
+qBittorrent completion poll, and a five-second per-connector health timeout.
+Override these with `CROWDARRR_ACTION_MAX_CONCURRENCY`,
+`CROWDARRR_ACTION_MAX_PENDING`, `CROWDARRR_HASH_MAX_CONCURRENCY`,
+`CROWDARRR_QBIT_POLL_INTERVAL_SECONDS`, and
+`CROWDARRR_HEALTHCHECK_TIMEOUT_SECONDS`. Values must be positive integers;
+invalid values are logged and replaced with their defaults.
 
 ## Byte-exact repair and safety
 
@@ -143,8 +162,10 @@ key by environment is supported for managed deployments; never commit it.
 
 ## Persistence, backup, and restore
 
-All persistent state is below `CROWDARRR_DATA_DIR` (`/config` in the examples),
-including `crowdarrr.sqlite3` and the locally generated encryption key.
+All persistent state is below the container's `/config` directory, including
+`crowdarrr.sqlite3` and the locally generated encryption key. The packaged
+entrypoint rejects a different `CROWDARRR_DATA_DIR` to prevent a configuration
+mistake from changing ownership across a broad host bind mount.
 
 For a consistent simple backup, stop the container, copy the whole host `config`
 directory, then restart it:
