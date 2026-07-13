@@ -1,0 +1,60 @@
+# Reference schema only. Crowdarrr currently persists settings in SQLite through
+# the web UI; this file is not imported automatically and contains no secrets.
+
+crowdnfo:
+  base_url: https://crowdnfo.net
+  api_key: ""
+
+qbittorrent:
+  enabled: false
+  base_url: http://qbittorrent:8080
+  username: ""
+  password: ""
+  api_key: ""
+
+sabnzbd:
+  enabled: false
+  base_url: http://sabnzbd:8080
+  username: ""
+  password: ""
+  api_key: ""
+
+radarr:
+  enabled: false
+  base_url: http://radarr:7878
+  username: ""
+  password: ""
+  api_key: ""
+
+sonarr:
+  enabled: false
+  base_url: http://sonarr:8989
+  username: ""
+  password: ""
+  api_key: ""
+
+umlautadaptarr:
+  enabled: false
+  base_url: http://umlautadaptarr:5005
+  username: ""
+  password: ""
+  api_key: ""
+
+download_mode: new_and_backfill
+auto_recheck: true
+contribute:
+  enabled: false
+  nfo: true
+  mediainfo: true
+  filelist: true
+match_strategy: hash_then_release_name
+hash_max_size_bytes: 5368709120
+path_mappings:
+  - remote_root: /data
+    local_root: /data
+category_mappings:
+  radarr: Movies
+  sonarr: TV
+backfill_cron: "0 3 * * *"
+dry_run: true
+application_api_token: ""
