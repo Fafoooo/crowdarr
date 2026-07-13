@@ -1,0 +1,711 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+import pytest
+from backend.runtime import CrowdarrrRuntime
+
+from backend.connectors.health import ConnectorHealth
+from backend.connectors.qbit import MissingNFO, TorrentFile, TorrentSnapshot
+from backend.connectors.sab import SABCompletionEvent, SABWebhookHandler
+from backend.core.files import PathMapper, PathMapping
+from backend.core.library import LibraryMediaItem
+from backend.core.repair import RepairResult, RepairStatus, TorrentRepairService
+from backend.core.settings import (
+    AppSettings,
+    ConnectorSettings,
+    ContributionSettings,
+    DownloadMode,
+    PathMappingSetting,
+)
+
+RAW_NFO = b"\xffbyte-exact\r\nrelease nfo\r\n"
+
+
+def connector_settings(name: str, *, enabled: bool) -> ConnectorSettings:
+    return ConnectorSettings(enabled=enabled, base_url=f"http://{name}.test:8080")
+
+
+def runtime_settings(
+    tmp_path: Path,
+    *,
+    mode: DownloadMode = DownloadMode.NEW_AND_BACKFILL,
+    dry_run: bool = False,
+    qbit_enabled: bool = True,
+    sab_enabled: bool = False,
+    radarr_enabled: bool = False,
+    sonarr_enabled: bool = False,
+    contribute: bool = False,
+) -> AppSettings:
+    data_root = tmp_path / "data"
+    data_root.mkdir(exist_ok=True)
+    return AppSettings(
+        qbittorrent=connector_settings("qbittorrent", enabled=qbit_enabled),
+        sabnzbd=connector_settings("sabnzbd", enabled=sab_enabled),
+        radarr=connector_settings("radarr", enabled=radarr_enabled),
+        sonarr=connector_settings("sonarr", enabled=sonarr_enabled),
+        download_mode=mode,
+        dry_run=dry_run,
+        contribute=ContributionSettings(enabled=contribute),
+        path_mappings=[
+            PathMappingSetting(remote_root="/data", local_root=str(data_root))
+        ],
+    )
+
+
+def torrent_files(release: str, *, nfo_progress: float = 0.0) -> list[TorrentFile]:
+    return [
+        TorrentFile(
+            index=7,
+            path=f"{release}/{release}.nfo",
+            size=8_192,
+            progress=nfo_progress,
+            priority=0,
+        ),
+        TorrentFile(
+            index=8,
+            path=f"{release}/{release}.mkv",
+            size=8_000_000_000,
+            progress=1.0,
+            priority=1,
+        ),
+    ]
+
+
+def torrent_snapshot(
+    torrent_hash: str,
+    release: str,
+    *,
+    progress: float = 0.999,
+    state: str = "stalledDL",
+    files: list[TorrentFile] | None = None,
+) -> TorrentSnapshot:
+    return TorrentSnapshot(
+        torrent_hash=torrent_hash,
+        name=release,
+        category="cross-seed-link",
+        content_path="/data/cross-seeds",
+        progress=progress,
+        state=state,
+        files=files or [],
+    )
+
+
+class FakeRuntimeStore:
+    """Small persistence fake defining the runtime repository boundary."""
+
+    def __init__(self) -> None:
+        self.counters = {
+            "fetched": 0,
+            "matches": 0,
+            "misses": 0,
+            "repaired": 0,
+            "uploaded": 0,
+        }
+        self.activities: list[dict[str, Any]] = []
+        self.misses: list[dict[str, Any]] = []
+        self.jobs: dict[str, dict[str, Any]] = {}
+
+    async def start_job(self, *, action: str, target: str | None = None) -> str:
+        job_id = f"job-{len(self.jobs) + 1}"
+        self.jobs[job_id] = {
+            "action": action,
+            "target": target,
+            "status": "running",
+            "detail": None,
+        }
+        return job_id
+
+    async def finish_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        self.jobs[job_id].update(status=status, detail=detail)
+
+    async def increment_counter(self, name: str, amount: int = 1) -> None:
+        self.counters[name] += amount
+
+    async def record_activity(
+        self,
+        *,
+        activity_type: str,
+        status: str,
+        title: str,
+        message: str,
+        miss_id: str | None = None,
+    ) -> str:
+        activity_id = f"activity-{len(self.activities) + 1}"
+        self.activities.append(
+            {
+                "id": activity_id,
+                "type": activity_type,
+                "status": status,
+                "title": title,
+                "message": message,
+                "miss_id": miss_id,
+                "created_at": f"2026-01-01T00:00:{len(self.activities):02d}Z",
+            }
+        )
+        return activity_id
+
+    async def record_miss(
+        self,
+        *,
+        source: str,
+        release_name: str,
+        reason: str,
+        retryable: bool,
+    ) -> str:
+        miss_id = f"miss-{len(self.misses) + 1}"
+        self.misses.append(
+            {
+                "id": miss_id,
+                "source": source,
+                "release_name": release_name,
+                "reason": reason,
+                "retryable": retryable,
+            }
+        )
+        return miss_id
+
+    async def get_counters(self) -> dict[str, int]:
+        return dict(self.counters)
+
+    async def recent_activity(self, *, limit: int) -> list[dict[str, Any]]:
+        return list(reversed(self.activities[-limit:]))
+
+
+class FakeQBit:
+    def __init__(
+        self,
+        snapshots: list[TorrentSnapshot],
+        files: dict[str, list[TorrentFile]],
+        *,
+        list_error: Exception | None = None,
+        health: ConnectorHealth | None = None,
+    ) -> None:
+        self.snapshots = {snapshot.torrent_hash: snapshot for snapshot in snapshots}
+        self.files = files
+        self.list_error = list_error
+        self.health = health or ConnectorHealth(True, version="5.0.4")
+        self.calls: list[tuple[Any, ...]] = []
+        self.rechecked: set[str] = set()
+
+    async def list_torrents(self) -> list[TorrentSnapshot]:
+        self.calls.append(("list_torrents",))
+        if self.list_error is not None:
+            raise self.list_error
+        return list(self.snapshots.values())
+
+    async def list_files(self, torrent_hash: str) -> list[TorrentFile]:
+        self.calls.append(("list_files", torrent_hash))
+        return self.files[torrent_hash]
+
+    async def get_torrent(self, torrent_hash: str) -> TorrentSnapshot:
+        self.calls.append(("get_torrent", torrent_hash))
+        snapshot = self.snapshots[torrent_hash]
+        if torrent_hash not in self.rechecked:
+            return TorrentSnapshot(
+                torrent_hash=snapshot.torrent_hash,
+                name=snapshot.name,
+                category=snapshot.category,
+                content_path=snapshot.content_path,
+                progress=snapshot.progress,
+                state=snapshot.state,
+                files=self.files[torrent_hash],
+            )
+        return torrent_snapshot(
+            torrent_hash,
+            snapshot.name,
+            progress=1.0,
+            state="uploading",
+            files=torrent_files(snapshot.name, nfo_progress=1.0),
+        )
+
+    async def set_file_priority(
+        self, torrent_hash: str, file_ids: list[int], priority: int
+    ) -> None:
+        self.calls.append(("priority", torrent_hash, file_ids, priority))
+
+    async def force_recheck(self, torrent_hash: str) -> None:
+        self.calls.append(("recheck", torrent_hash))
+        self.rechecked.add(torrent_hash)
+
+    async def resume(self, torrent_hash: str) -> TorrentSnapshot:
+        self.calls.append(("resume", torrent_hash))
+        return await self.get_torrent(torrent_hash)
+
+    async def healthcheck(self) -> ConnectorHealth:
+        self.calls.append(("healthcheck",))
+        return self.health
+
+
+class FakeCrowdNFO:
+    def __init__(
+        self,
+        responses: dict[str, bytes | Exception],
+        *,
+        health: ConnectorHealth | None = None,
+    ) -> None:
+        self.responses = responses
+        self.health = health or ConnectorHealth(True, version="beta")
+        self.download_calls: list[tuple[str, str | None]] = []
+
+    async def download_nfo(
+        self,
+        *,
+        release_name: str,
+        media_sha256: str | None = None,
+    ) -> bytes:
+        self.download_calls.append((release_name, media_sha256))
+        result = self.responses[release_name]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def healthcheck(self) -> ConnectorHealth:
+        return self.health
+
+
+class RecordingWriter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Path, bytes, bool]] = []
+
+    def __call__(self, path: Path, payload: bytes, *, overwrite: bool) -> None:
+        self.calls.append((path, payload, overwrite))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+
+class FakeRepairService:
+    def __init__(self, results: dict[str, RepairResult | Exception]) -> None:
+        self.results = results
+        self.calls: list[MissingNFO] = []
+
+    async def repair(self, candidate: MissingNFO) -> RepairResult:
+        self.calls.append(candidate)
+        result = self.results[candidate.torrent_hash]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class FakeLibraryConnector:
+    def __init__(
+        self,
+        items: list[LibraryMediaItem] | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.items = items or []
+        self.error = error
+        self.calls = 0
+
+    async def scan(self) -> list[LibraryMediaItem]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.items
+
+
+class FakeSABLiveService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, SABCompletionEvent]] = []
+
+    async def fetch_missing(self, event: SABCompletionEvent) -> None:
+        self.calls.append(("fetch", event))
+        raise ConnectionError("live-in unavailable; api_key=must-not-leak")
+
+    async def contribute(self, event: SABCompletionEvent) -> None:
+        self.calls.append(("contribute", event))
+
+
+class FakeHealthConnector:
+    def __init__(self, result: ConnectorHealth | Exception) -> None:
+        self.result = result
+
+    async def healthcheck(self) -> ConnectorHealth:
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+class FakeActionQueue:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, str]]] = []
+
+    async def enqueue(self, *, action: str, payload: dict[str, str]) -> str:
+        self.calls.append((action, payload))
+        return f"queued-{len(self.calls)}"
+
+
+@pytest.mark.asyncio
+async def test_discovery_hydrates_qbit_files_and_exposes_only_stuck_candidates(
+    tmp_path: Path,
+) -> None:
+    stuck = torrent_snapshot("stuck", "Release.Stuck-GROUP")
+    complete = torrent_snapshot(
+        "complete",
+        "Release.Complete-GROUP",
+        progress=1.0,
+        state="uploading",
+    )
+    qbit = FakeQBit(
+        [stuck, complete],
+        {
+            "stuck": torrent_files(stuck.name),
+            "complete": torrent_files(complete.name, nfo_progress=1.0),
+        },
+    )
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=FakeRuntimeStore(),
+        qbit=qbit,
+    )
+
+    candidates = await runtime.discover_stuck_torrents()
+
+    assert len(candidates) == 1
+    assert isinstance(candidates[0], MissingNFO)
+    assert candidates[0].torrent_hash == "stuck"
+    assert candidates[0].relative_path.as_posix().endswith(".nfo")
+    assert qbit.calls == [("list_torrents",), ("list_files", "stuck")]
+
+
+@pytest.mark.asyncio
+async def test_scan_and_repair_preserves_bytes_and_persists_job_counters_and_miss(
+    tmp_path: Path,
+) -> None:
+    good = torrent_snapshot("good", "Release.Good-GROUP")
+    missing = torrent_snapshot("missing", "Release.Missing-GROUP")
+    qbit = FakeQBit(
+        [good, missing],
+        {
+            good.torrent_hash: torrent_files(good.name),
+            missing.torrent_hash: torrent_files(missing.name),
+        },
+    )
+    crowdnfo = FakeCrowdNFO(
+        {
+            good.name: RAW_NFO,
+            missing.name: LookupError("release was not found"),
+        }
+    )
+    data_root = tmp_path / "data"
+    mapper = PathMapper(
+        mappings=[PathMapping(remote_root="/data", local_root=data_root)],
+        allowed_roots=[data_root],
+    )
+    writer = RecordingWriter()
+    repair = TorrentRepairService(
+        crowdnfo=crowdnfo,
+        qbit=qbit,
+        path_mapper=mapper,
+        atomic_writer=writer,
+        poll_interval=0.01,
+        recheck_timeout=1.0,
+    )
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=qbit,
+        repair_service=repair,
+    )
+
+    outcome = await runtime.scan_and_repair()
+
+    target = data_root / "cross-seeds/Release.Good-GROUP/Release.Good-GROUP.nfo"
+    assert target.read_bytes() == RAW_NFO
+    assert writer.calls == [(target, RAW_NFO, True)]
+    assert outcome.job_id == "job-1"
+    assert outcome.status == "partial"
+    assert store.counters == {
+        "fetched": 1,
+        "matches": 1,
+        "misses": 1,
+        "repaired": 1,
+        "uploaded": 0,
+    }
+    assert store.jobs["job-1"]["status"] == "partial"
+    assert store.misses == [
+        {
+            "id": "miss-1",
+            "source": "qbittorrent",
+            "release_name": missing.name,
+            "reason": "not found",
+            "retryable": True,
+        }
+    ]
+    assert {activity["type"] for activity in store.activities} >= {"repair", "miss"}
+
+
+@pytest.mark.asyncio
+async def test_per_torrent_repair_targets_only_the_requested_hash(
+    tmp_path: Path,
+) -> None:
+    first = torrent_snapshot("first", "Release.First-GROUP")
+    second = torrent_snapshot("second", "Release.Second-GROUP")
+    qbit = FakeQBit(
+        [first, second],
+        {
+            first.torrent_hash: torrent_files(first.name),
+            second.torrent_hash: torrent_files(second.name),
+        },
+    )
+    repair = FakeRepairService(
+        {
+            "second": RepairResult(
+                status=RepairStatus.SUCCESS,
+                target_path=tmp_path / "second.nfo",
+                verified=True,
+                seeding=True,
+            )
+        }
+    )
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=qbit,
+        repair_service=repair,
+    )
+
+    outcome = await runtime.repair_torrent("second")
+
+    assert outcome.status == "success"
+    assert outcome.job_id == "job-1"
+    assert [candidate.torrent_hash for candidate in repair.calls] == ["second"]
+    assert ("list_torrents",) not in qbit.calls
+    assert qbit.calls[:1] == [("get_torrent", "second")]
+    assert store.counters["repaired"] == 1
+
+
+@pytest.mark.asyncio
+async def test_modes_disabled_connector_and_dry_run_gate_mutations(
+    tmp_path: Path,
+) -> None:
+    snapshot = torrent_snapshot("dry", "Release.Dry-GROUP")
+
+    off_qbit = FakeQBit([snapshot], {"dry": torrent_files(snapshot.name)})
+    off = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path, mode=DownloadMode.OFF),
+        store=FakeRuntimeStore(),
+        qbit=off_qbit,
+    )
+    off_outcome = await off.scan_and_repair()
+
+    disabled_qbit = FakeQBit([snapshot], {"dry": torrent_files(snapshot.name)})
+    disabled = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path, qbit_enabled=False),
+        store=FakeRuntimeStore(),
+        qbit=disabled_qbit,
+    )
+    disabled_outcome = await disabled.scan_and_repair()
+
+    dry_qbit = FakeQBit([snapshot], {"dry": torrent_files(snapshot.name)})
+    dry_crowdnfo = FakeCrowdNFO({snapshot.name: RAW_NFO})
+    data_root = tmp_path / "data"
+    dry_repair = TorrentRepairService(
+        crowdnfo=dry_crowdnfo,
+        qbit=dry_qbit,
+        path_mapper=PathMapper(
+            mappings=[PathMapping(remote_root="/data", local_root=data_root)],
+            allowed_roots=[data_root],
+        ),
+        dry_run=True,
+    )
+    dry_store = FakeRuntimeStore()
+    dry = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path, dry_run=True),
+        store=dry_store,
+        qbit=dry_qbit,
+        repair_service=dry_repair,
+    )
+    dry_outcome = await dry.scan_and_repair()
+
+    assert off_outcome.status == "skipped" and off_qbit.calls == []
+    assert disabled_outcome.status == "skipped" and disabled_qbit.calls == []
+    assert dry_outcome.status == "dry_run"
+    assert dry_crowdnfo.download_calls == []
+    assert not {"priority", "recheck", "resume"} & {call[0] for call in dry_qbit.calls}
+    assert dry_store.counters["repaired"] == 0
+
+
+@pytest.mark.asyncio
+async def test_library_backfill_fetches_raw_sidecars_for_radarr_and_sonarr(
+    tmp_path: Path,
+) -> None:
+    movie = tmp_path / "data/movies/Movie/Movie.mkv"
+    episode = tmp_path / "data/series/Show/Show.S01E01.mkv"
+    movie.parent.mkdir(parents=True)
+    episode.parent.mkdir(parents=True)
+    movie.write_bytes(b"movie")
+    episode.write_bytes(b"episode")
+    movie_item = LibraryMediaItem("Movie.2026-GROUP", movie, source="radarr")
+    episode_item = LibraryMediaItem("Show.S01E01-GROUP", episode, source="sonarr")
+    crowdnfo = FakeCrowdNFO(
+        {movie_item.release_name: RAW_NFO, episode_item.release_name: b"tv\r\n\xff"}
+    )
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(
+            tmp_path,
+            radarr_enabled=True,
+            sonarr_enabled=True,
+        ),
+        store=store,
+        crowdnfo=crowdnfo,
+        library_connectors={
+            "radarr": FakeLibraryConnector([movie_item]),
+            "sonarr": FakeLibraryConnector([episode_item]),
+        },
+    )
+
+    outcome = await runtime.scan_libraries()
+
+    assert outcome.status == "success"
+    assert movie.with_suffix(".nfo").read_bytes() == RAW_NFO
+    assert episode.with_suffix(".nfo").read_bytes() == b"tv\r\n\xff"
+    assert crowdnfo.download_calls == [
+        (movie_item.release_name, None),
+        (episode_item.release_name, None),
+    ]
+    assert store.counters["fetched"] == 2
+    assert store.counters["matches"] == 2
+
+
+@pytest.mark.asyncio
+async def test_sab_completion_isolates_live_in_failure_from_contribution(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    live = FakeSABLiveService()
+    webhook = SABWebhookHandler(
+        live_service=live,
+        fetch_enabled=True,
+        contribute_enabled=True,
+    )
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(
+            tmp_path,
+            mode=DownloadMode.NEW_ONLY,
+            sab_enabled=True,
+            contribute=True,
+        ),
+        store=store,
+        sab_webhook=webhook,
+    )
+    event = SABCompletionEvent(
+        release_name="Movie.2026-GROUP",
+        storage_path="/data/downloads/Movie.2026-GROUP",
+        category="movies",
+    )
+
+    outcome = await runtime.handle_sab_completion(event)
+
+    assert [name for name, _ in live.calls] == ["fetch", "contribute"]
+    assert outcome.status == "partial"
+    assert outcome.result.accepted is True
+    assert outcome.result.errors == {"fetch": "connection failed"}
+    assert store.counters["fetched"] == 0
+    assert store.counters["uploaded"] == 1
+    assert store.jobs["job-1"]["status"] == "partial"
+    assert "must-not-leak" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dashboard_snapshot_combines_health_counters_activity_and_stuck(
+    tmp_path: Path,
+) -> None:
+    stuck = torrent_snapshot("dashboard", "Release.Dashboard-GROUP")
+    qbit = FakeQBit([stuck], {stuck.torrent_hash: torrent_files(stuck.name)})
+    store = FakeRuntimeStore()
+    store.counters.update(fetched=4, matches=3, misses=1, repaired=2, uploaded=5)
+    await store.record_activity(
+        activity_type="repair",
+        status="success",
+        title="Torrent repaired",
+        message=stuck.name,
+    )
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path, radarr_enabled=True),
+        store=store,
+        qbit=qbit,
+        health_connectors={
+            "crowdnfo": FakeHealthConnector(ConnectorHealth(True, version="beta")),
+            "qbittorrent": qbit,
+            "radarr": FakeHealthConnector(
+                ConnectorHealth(False, detail="connection failed")
+            ),
+        },
+    )
+
+    snapshot = await runtime.dashboard_snapshot()
+
+    health = {connector.id: connector for connector in snapshot.connectors}
+    assert health["crowdnfo"].status == "healthy"
+    assert health["qbittorrent"].status == "healthy"
+    assert health["radarr"].status == "unhealthy"
+    assert snapshot.counters.fetched == 4
+    assert snapshot.counters.repaired == 2
+    assert snapshot.recent_activity[0].title == "Torrent repaired"
+    assert len(snapshot.stuck_torrents) == 1
+    assert snapshot.stuck_torrents[0].hash == "dashboard"
+    assert snapshot.stuck_torrents[0].missing_nfo_path.endswith(".nfo")
+
+
+@pytest.mark.asyncio
+async def test_actions_enqueue_tasks_and_return_stable_job_ids(tmp_path: Path) -> None:
+    queue = FakeActionQueue()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=FakeRuntimeStore(),
+        action_queue=queue,
+    )
+
+    scan = await runtime.enqueue_scan_and_repair()
+    repair = await runtime.enqueue_repair_torrent("deadbeef")
+
+    assert scan.job_id == "queued-1"
+    assert repair.job_id == "queued-2"
+    assert queue.calls == [
+        ("scan_and_repair", {}),
+        ("repair_torrent", {"torrent_hash": "deadbeef"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_connector_outage_is_skipped_and_sanitized_without_aborting_job(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    qbit = FakeQBit(
+        [],
+        {},
+        list_error=ConnectionError("offline; password=must-not-leak"),
+    )
+    store = FakeRuntimeStore()
+    runtime = CrowdarrrRuntime(
+        settings=runtime_settings(tmp_path),
+        store=store,
+        qbit=qbit,
+    )
+
+    outcome = await runtime.scan_and_repair()
+
+    assert outcome.status == "skipped"
+    assert store.jobs["job-1"]["status"] == "skipped"
+    assert store.activities[-1]["status"] == "warning"
+    assert store.activities[-1]["message"] == "connection failed"
+    assert "qbittorrent" in caplog.text.lower()
+    assert "unavailable" in caplog.text.lower()
+    assert "must-not-leak" not in caplog.text
