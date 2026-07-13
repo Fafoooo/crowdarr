@@ -15,6 +15,7 @@ from backend.connectors.qbit import (
     MissingNFO,
     TorrentFile,
     TorrentSnapshot,
+    reported_file_path,
 )
 from backend.core.files import (
     MismatchCleanupPolicy,
@@ -173,10 +174,9 @@ class TorrentRepairService:
         video = self._primary_video(snapshot.files)
         if video is None:
             return None
-        relative = PurePosixPath(video.path)
-        if relative.is_absolute() or ".." in relative.parts:
+        reported_path = reported_file_path(snapshot, video.path)
+        if reported_path is None:
             return None
-        reported_path = PurePosixPath(snapshot.content_path).joinpath(relative)
         local_path = self._path_mapper.map_path(reported_path)
         result = await self._hash_service.hash_file(local_path)
         return result.digest

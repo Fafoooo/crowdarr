@@ -36,6 +36,7 @@ class TorrentSnapshot:
     content_path: str
     progress: float
     state: str
+    save_path: str = ""
     files: list[TorrentFile] = field(default_factory=list)
     local_content_path: Path | None = None
 
@@ -47,6 +48,26 @@ class MissingNFO:
     file_index: int
     relative_path: PurePosixPath
     reported_path: PurePosixPath
+
+
+def reported_file_path(
+    torrent: TorrentSnapshot,
+    relative_path: str | PurePosixPath,
+) -> PurePosixPath | None:
+    """Return qBittorrent's absolute file path without duplicating its content root.
+
+    The WebUI API reports file names relative to ``save_path``. For multi-file
+    torrents, ``content_path`` already includes the torrent root directory, so
+    joining file names to it would produce a duplicate directory component.
+    """
+
+    relative = PurePosixPath(relative_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    root = PurePosixPath(torrent.save_path or torrent.content_path)
+    if not root.is_absolute() or ".." in root.parts:
+        return None
+    return root.joinpath(relative)
 
 
 def find_stuck_nfos(
@@ -69,15 +90,13 @@ def find_stuck_nfos(
     if not videos or any(item.progress < video_threshold for item in videos):
         return []
 
-    content_root = PurePosixPath(torrent.content_path)
-    if not content_root.is_absolute() or ".." in content_root.parts:
-        return []
     missing: list[MissingNFO] = []
     for item in torrent.files:
         relative = PurePosixPath(item.path)
         if relative.suffix.lower() != ".nfo" or item.progress >= 1:
             continue
-        if relative.is_absolute() or ".." in relative.parts:
+        reported_path = reported_file_path(torrent, relative)
+        if reported_path is None:
             continue
         missing.append(
             MissingNFO(
@@ -85,7 +104,7 @@ def find_stuck_nfos(
                 torrent_name=torrent.name,
                 file_index=item.index,
                 relative_path=relative,
-                reported_path=content_root.joinpath(relative),
+                reported_path=reported_path,
             )
         )
     return missing
@@ -165,6 +184,7 @@ class QBitConnector:
         snapshots: list[TorrentSnapshot] = []
         for raw in data:
             content_path = str(raw.get("content_path", raw.get("save_path", "")))
+            save_path = str(raw.get("save_path", ""))
             local_path = (
                 self._path_mapper.map_path(content_path)
                 if self._path_mapper is not None and content_path
@@ -176,6 +196,7 @@ class QBitConnector:
                     name=str(raw["name"]),
                     category=str(raw.get("category", "")),
                     content_path=content_path,
+                    save_path=save_path,
                     progress=float(raw.get("progress", 0.0)),
                     state=str(raw.get("state", "unknown")),
                     local_content_path=local_path,
@@ -214,6 +235,7 @@ class QBitConnector:
             raise LookupError(f"qBittorrent torrent was not found: {torrent_hash}")
         raw = data[0]
         content_path = str(raw.get("content_path", raw.get("save_path", "")))
+        save_path = str(raw.get("save_path", ""))
         files = await self.list_files(torrent_hash)
         local_path = (
             self._path_mapper.map_path(content_path)
@@ -225,6 +247,7 @@ class QBitConnector:
             name=str(raw["name"]),
             category=str(raw.get("category", "")),
             content_path=content_path,
+            save_path=save_path,
             progress=float(raw.get("progress", 0.0)),
             state=str(raw.get("state", "unknown")),
             files=files,
