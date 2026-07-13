@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-13
+
 ### Added
 
 - Initial FastAPI, SQLite, scheduler, connector, matching, repair, contribution,
@@ -36,3 +38,6 @@ All notable changes to this project are documented here. The format follows
   `docs/crowdnfo-api.md`.
 - YAML configuration is illustrative and is not automatically imported; the UI
   and SQLite are authoritative.
+
+[Unreleased]: https://github.com/Fafoooo/crowdarr/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Fafoooo/crowdarr/releases/tag/v0.1.0
