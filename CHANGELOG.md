@@ -6,6 +6,37 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-13
+
+### Added
+
+- Persist per-torrent repair outcomes and surface clear inline states for fixed,
+  unavailable, transient, pending, and non-NFO-related downloads.
+- Add a configurable recheck timeout, a durable `placed` counter, delayed repair
+  reconciliation, and a dashboard funnel from match through verified repair.
+- Cache definitive CrowdNFO misses for 12 hours so repeated repair attempts do not
+  re-query the service or inflate lifetime counters.
+
+### Fixed
+
+- Include release names and actionable reasons in repair, lookup, and contribution
+  activity; keep transient CrowdNFO failures retryable instead of counting them as
+  permanent misses.
+- Replace the incompatible `/api/user/me` profile-key test with an honest release
+  endpoint probe that distinguishes invalid credentials from an API that is merely
+  reachable but cannot verify the key.
+- Raise the qBittorrent recheck default from 5 to 30 minutes and reconcile torrents
+  that finish after the foreground job returns.
+- Bound and pace CrowdNFO traffic while retrying connection errors, rate limits,
+  and server failures with backoff.
+- Improve connector states, repair-readiness badges, long-name handling, responsive
+  torrent cards, loading states, and dashboard KPI readability.
+- Standardize new user-facing names and environment variables on `crowdarr` while
+  retaining legacy `CROWDARRR_*`, `crowdarrr.sqlite3`, SAB hook header, and GHCR
+  image compatibility for existing installations.
+- Preserve legacy-only environment overrides for direct `docker run` deployments
+  and retain their numeric PUID/PGID ownership while renaming the image user.
+
 ## [0.1.2] - 2026-07-13
 
 ### Added
@@ -74,7 +105,7 @@ All notable changes to this project are documented here. The format follows
 - Remove recursive ownership changes from container startup and restrict
   automatic ownership repair to known state files under `/config`.
 - Preserve an NFO that another process replaces while qBittorrent is rechecking;
-  mismatch cleanup removes only the exact payload Crowdarrr placed.
+  mismatch cleanup removes only the exact payload crowdarr placed.
 - Raise vulnerable `cryptography`, Black, and pytest dependency ranges to fixed
   releases.
 
@@ -86,7 +117,8 @@ All notable changes to this project are documented here. The format follows
 - YAML configuration is illustrative and is not automatically imported; the UI
   and SQLite are authoritative.
 
-[Unreleased]: https://github.com/Fafoooo/crowdarr/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Fafoooo/crowdarr/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Fafoooo/crowdarr/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Fafoooo/crowdarr/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Fafoooo/crowdarr/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Fafoooo/crowdarr/releases/tag/v0.1.0

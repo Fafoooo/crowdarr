@@ -1,4 +1,4 @@
-# Reference schema only. Crowdarrr currently persists settings in SQLite through
+# Reference schema only. crowdarr currently persists settings in SQLite through
 # the web UI; this file is not imported automatically and contains no secrets.
 
 crowdnfo:
@@ -42,6 +42,7 @@ umlautadaptarr:
 
 download_mode: new_and_backfill
 auto_recheck: true
+recheck_timeout_seconds: 1800
 nfo_mismatch_policy: keep
 contribute:
   enabled: false
@@ -59,11 +60,12 @@ category_mappings:
 backfill_cron: "0 3 * * *"
 dry_run: true
 
-# Protect /api with CROWDARRR_API_TOKEN in the process environment. API clients
+# Protect /api with CROWDARR_API_TOKEN in the process environment. API clients
 # can alternatively set the write-only application_api_token through
 # /api/settings; the browser form omits it to avoid locking itself out without
 # proxy injection.
-# The optional SAB webhook likewise uses CROWDARRR_SAB_WEBHOOK_SECRET from the
+# The optional SAB webhook likewise uses CROWDARR_SAB_WEBHOOK_SECRET from the
 # environment, never a connector API key.
+# Legacy CROWDARRR_* names remain supported for existing installations.
 # Queue, hashing, polling, webhook-size, and health-check bounds are also runtime
 # environment settings; see .env.example for their documented defaults.

@@ -1,6 +1,6 @@
-# Contributing to Crowdarrr
+# Contributing to crowdarr
 
-Thanks for improving Crowdarrr. Keep changes focused, test behavior at service
+Thanks for improving crowdarr. Keep changes focused, test behavior at service
 boundaries, and preserve the safety guarantees around media paths and raw NFO
 bytes.
 
@@ -54,7 +54,7 @@ npm run test:coverage
 npm run build
 cd ..
 
-docker build -t crowdarrr:dev .
+docker build -t crowdarr:dev .
 ```
 
 Backend coverage is enforced at 80% or higher. Prefer deterministic unit and
