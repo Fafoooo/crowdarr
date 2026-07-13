@@ -1,0 +1,14 @@
+.env
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+__pycache__/
+*.py[cod]
+*.sqlite3
+data/
+graphify-out/
+agents.log
