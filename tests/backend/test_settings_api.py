@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -11,9 +12,17 @@ import pytest
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
-from backend.core.settings import DownloadMode, SettingsPatch
+from backend import main as main_module
+from backend.core.files import MismatchCleanupPolicy
+from backend.core.settings import AppSettings, DownloadMode, SettingsPatch
 from backend.db.settings import SettingsStore
 from backend.main import create_app
+
+
+def _read_file_artifacts(directory: Path) -> bytes:
+    return b"".join(
+        artifact.read_bytes() for artifact in directory.iterdir() if artifact.is_file()
+    )
 
 
 @pytest.mark.asyncio
@@ -28,6 +37,7 @@ async def test_settings_defaults_are_complete_generic_and_persisted(
     assert str(settings.crowdnfo.base_url).rstrip("/") == "https://crowdnfo.net"
     assert settings.download_mode is DownloadMode.OFF
     assert settings.auto_recheck is True
+    assert settings.nfo_mismatch_policy is MismatchCleanupPolicy.KEEP
     assert settings.contribute.enabled is False
     assert settings.match_strategy == "hash_then_release_name"
     assert settings.hash_max_size_bytes > 0
@@ -44,7 +54,13 @@ async def test_settings_defaults_are_complete_generic_and_persisted(
     assert "10.10.3." not in serialized
     assert "/home/ubuntu/media" not in serialized
 
-    await first.update(SettingsPatch(dry_run=False, backfill_cron="15 4 * * 1"))
+    await first.update(
+        SettingsPatch(
+            dry_run=False,
+            backfill_cron="15 4 * * 1",
+            nfo_mismatch_policy=MismatchCleanupPolicy.REMOVE,
+        )
+    )
     await first.close()
     reopened = SettingsStore(database)
     await reopened.initialize()
@@ -53,6 +69,7 @@ async def test_settings_defaults_are_complete_generic_and_persisted(
 
     assert persisted.dry_run is False
     assert persisted.backfill_cron == "15 4 * * 1"
+    assert persisted.nfo_mismatch_policy is MismatchCleanupPolicy.REMOVE
 
 
 @pytest.mark.parametrize(
@@ -60,24 +77,86 @@ async def test_settings_defaults_are_complete_generic_and_persisted(
     [
         {"crowdnfo": {"base_url": "javascript:alert(1)"}},
         {"backfill_cron": "not a cron expression"},
-        {
-            "path_mappings": [
-                {"remote_root": "relative/data", "local_root": "/data"}
-            ]
-        },
-        {
-            "path_mappings": [
-                {"remote_root": "/data", "local_root": "relative/data"}
-            ]
-        },
+        {"path_mappings": [{"remote_root": "relative/data", "local_root": "/data"}]},
+        {"path_mappings": [{"remote_root": "/data", "local_root": "relative/data"}]},
+        {"nfo_mismatch_policy": "delete_media"},
     ],
-    ids=["unsafe-url", "invalid-cron", "relative-remote", "relative-local"],
+    ids=[
+        "unsafe-url",
+        "invalid-cron",
+        "relative-remote",
+        "relative-local",
+        "unsafe-mismatch-policy",
+    ],
 )
 def test_settings_patch_validates_urls_cron_and_absolute_mappings(
     patch: dict[str, Any],
 ) -> None:
     with pytest.raises(ValidationError):
         SettingsPatch.model_validate(patch)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("keep", MismatchCleanupPolicy.KEEP),
+        ("remove", MismatchCleanupPolicy.REMOVE),
+    ],
+)
+def test_settings_patch_accepts_only_supported_nfo_mismatch_policies(
+    value: str,
+    expected: MismatchCleanupPolicy,
+) -> None:
+    patch = SettingsPatch.model_validate({"nfo_mismatch_policy": value})
+
+    assert patch.nfo_mismatch_policy is expected
+
+
+def test_runtime_composition_forwards_recheck_and_mismatch_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class StubConnector:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+    class RecordingRepairService:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(main_module, "CrowdNFOClient", StubConnector)
+    monkeypatch.setattr(main_module, "QBitConnector", StubConnector)
+    monkeypatch.setattr(
+        main_module,
+        "TorrentRepairService",
+        RecordingRepairService,
+    )
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    settings = AppSettings.model_validate(
+        {
+            "crowdnfo": {"api_key": "configured"},
+            "qbittorrent": {
+                "enabled": True,
+                "base_url": "http://qbittorrent:8080",
+            },
+            "path_mappings": [{"remote_root": "/data", "local_root": str(media_root)}],
+            "auto_recheck": False,
+            "nfo_mismatch_policy": "remove",
+            "dry_run": False,
+        }
+    )
+    services = main_module._DefaultServices(
+        settings=SimpleNamespace(),
+        operations=SimpleNamespace(),
+    )
+
+    services._compose_bundle(settings)
+
+    assert captured["auto_recheck"] is False
+    assert captured["keep_mismatch"] is False
 
 
 def test_settings_patch_accepts_public_custom_connector_and_path_values() -> None:
@@ -156,9 +235,7 @@ async def test_secrets_are_write_only_encrypted_and_blank_updates_preserve_them(
     await store.close()
 
     all_logs = caplog.text
-    all_artifacts = b"".join(
-        artifact.read_bytes() for artifact in tmp_path.iterdir() if artifact.is_file()
-    )
+    all_artifacts = await asyncio.to_thread(_read_file_artifacts, tmp_path)
     for secret in (
         "crowd-secret-value",
         "qbit-secret-value",
@@ -183,9 +260,7 @@ class FakeSettings:
 
     async def update_public(self, patch: dict[str, Any]) -> dict[str, Any]:
         self.updated = patch
-        return (await self.public_view()) | {
-            "dry_run": patch.get("dry_run", True)
-        }
+        return (await self.public_view()) | {"dry_run": patch.get("dry_run", True)}
 
 
 class FakeDashboard:

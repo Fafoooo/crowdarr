@@ -11,7 +11,11 @@ import pytest
 from backend.connectors.health import ConnectorSupervisor
 from backend.connectors.qbit import QBitConnector
 from backend.connectors.radarr import RadarrConnector
-from backend.connectors.sab import SABCompletionEvent, SABWebhookHandler, SABnzbdConnector
+from backend.connectors.sab import (
+    SABCompletionEvent,
+    SABnzbdConnector,
+    SABWebhookHandler,
+)
 from backend.connectors.sonarr import SonarrConnector
 from backend.connectors.umlaut import UmlautAdaptarrConnector
 from backend.core.contribution import ContributionItem, ContributionService
@@ -69,7 +73,7 @@ async def test_qbit_authenticated_webui_request_shapes_and_health(
         if path in {
             "/api/v2/torrents/filePrio",
             "/api/v2/torrents/recheck",
-            "/api/v2/torrents/resume",
+            "/api/v2/torrents/start",
         }:
             return httpx.Response(200, text="Ok.")
         if path == "/api/v2/app/version":
@@ -107,7 +111,7 @@ async def test_qbit_authenticated_webui_request_shapes_and_health(
         "/api/v2/torrents/files",
         "/api/v2/torrents/filePrio",
         "/api/v2/torrents/recheck",
-        "/api/v2/torrents/resume",
+        "/api/v2/torrents/start",
         "/api/v2/app/version",
     ]
     assert httpx.QueryParams(requests[3].content.decode()) == httpx.QueryParams(
@@ -120,8 +124,7 @@ async def test_qbit_authenticated_webui_request_shapes_and_health(
         {"hashes": "deadbeef"}
     )
     assert all(
-        request.headers.get("Cookie") == "SID=test-session"
-        for request in requests[1:]
+        request.headers.get("Cookie") == "SID=test-session" for request in requests[1:]
     )
 
 
@@ -146,6 +149,53 @@ async def test_qbit_can_use_webui_auth_whitelist_without_login() -> None:
         assert (await connector.healthcheck()).healthy is True
 
     assert "/api/v2/auth/login" not in paths
+
+
+@pytest.mark.parametrize("unsupported_status", [404, 405])
+@pytest.mark.asyncio
+async def test_qbit_start_uses_legacy_resume_only_when_start_is_unsupported(
+    unsupported_status: int,
+) -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/v2/torrents/start":
+            return httpx.Response(unsupported_status, text="unsupported")
+        if request.url.path == "/api/v2/torrents/resume":
+            return httpx.Response(200, text="Ok.")
+        raise AssertionError(f"unexpected qBittorrent request: {request}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        connector = QBitConnector(
+            base_url="http://qbittorrent:8080",
+            http_client=http,
+        )
+        await connector.resume("deadbeef")
+
+    assert paths == [
+        "/api/v2/torrents/start",
+        "/api/v2/torrents/resume",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_qbit_start_does_not_fallback_on_authorization_failure() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(401, text="Forbidden")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        connector = QBitConnector(
+            base_url="http://qbittorrent:8080",
+            http_client=http,
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            await connector.resume("deadbeef")
+
+    assert paths == ["/api/v2/torrents/start"]
 
 
 class FakeLiveService:
@@ -360,9 +410,7 @@ async def test_mediainfo_invocation_returns_subprocess_stdout_as_raw_bytes(
     result = await runner.inspect(media)
 
     assert result == raw_output
-    assert command_runner.calls == [
-        ("mediainfo", "--Output=JSON", str(media))
-    ]
+    assert command_runner.calls == [("mediainfo", "--Output=JSON", str(media))]
 
 
 class PartialFailureCrowdNFO:

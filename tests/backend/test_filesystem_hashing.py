@@ -81,6 +81,107 @@ def test_path_mapper_rejects_symlink_escape(tmp_path: Path) -> None:
         mapper.map_path("/data/escape/release.nfo")
 
 
+@pytest.mark.parametrize("symlink_kind", ["target", "parent"])
+def test_path_mapper_rejects_symlinks_even_within_allowed_root(
+    tmp_path: Path,
+    symlink_kind: str,
+) -> None:
+    allowed = tmp_path / "allowed"
+    real_parent = allowed / "real"
+    allowed.mkdir()
+    real_parent.mkdir()
+    mapper = PathMapper(
+        mappings=[PathMapping(remote_root="/data", local_root=allowed)],
+        allowed_roots=[allowed],
+    )
+
+    if symlink_kind == "target":
+        media = allowed / "release.mkv"
+        media.write_bytes(b"media")
+        (allowed / "release.nfo").symlink_to(media.name)
+        reported_path = "/data/release.nfo"
+    else:
+        (allowed / "alias").symlink_to(real_parent, target_is_directory=True)
+        reported_path = "/data/alias/release.nfo"
+
+    with pytest.raises(UnsafePathError, match="symlink"):
+        mapper.map_path(reported_path)
+
+
+def _attempt_atomic_write(
+    path: Path, payload: bytes, *, root: Path
+) -> Exception | None:
+    try:
+        atomic_write_bytes(
+            path,
+            payload,
+            allowed_roots=[root],
+            overwrite=True,
+        )
+    except UnsafePathError as error:
+        return error
+    return None
+
+
+def _temporary_files(directory: Path) -> list[Path]:
+    return [
+        child
+        for child in directory.iterdir()
+        if child.name.startswith(".") and child.name.endswith(".tmp")
+    ]
+
+
+def test_atomic_write_rejects_final_nfo_symlink_without_mutating_media(
+    tmp_path: Path,
+) -> None:
+    media = tmp_path / "release.mkv"
+    original_media = b"irreplaceable media bytes"
+    media.write_bytes(original_media)
+    target = tmp_path / "release.nfo"
+    target.symlink_to(media.name)
+
+    error = _attempt_atomic_write(target, b"downloaded nfo", root=tmp_path)
+
+    assert media.read_bytes() == original_media
+    assert target.is_symlink()
+    assert _temporary_files(tmp_path) == []
+    assert isinstance(error, UnsafePathError)
+
+
+def test_atomic_write_rejects_symlinked_parent_without_leaving_artifacts(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    real_parent = allowed / "real"
+    real_parent.mkdir(parents=True)
+    media = real_parent / "release.mkv"
+    original_media = b"media remains untouched"
+    media.write_bytes(original_media)
+    alias = allowed / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    target = alias / "release.nfo"
+
+    error = _attempt_atomic_write(target, b"downloaded nfo", root=allowed)
+
+    assert media.read_bytes() == original_media
+    assert not (real_parent / "release.nfo").exists()
+    assert alias.is_symlink()
+    assert _temporary_files(real_parent) == []
+    assert isinstance(error, UnsafePathError)
+
+
+def test_atomic_nfo_write_rejects_a_non_nfo_lexical_target(tmp_path: Path) -> None:
+    media = tmp_path / "release.mkv"
+    original_media = b"media must never be an NFO write target"
+    media.write_bytes(original_media)
+
+    error = _attempt_atomic_write(media, b"downloaded nfo", root=tmp_path)
+
+    assert media.read_bytes() == original_media
+    assert _temporary_files(tmp_path) == []
+    assert isinstance(error, UnsafePathError)
+
+
 def test_atomic_write_preserves_raw_bytes_and_leaves_no_temporary_file(
     tmp_path: Path,
 ) -> None:

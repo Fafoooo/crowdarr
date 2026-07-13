@@ -9,7 +9,6 @@ import pytest
 from backend.connectors.qbit import TorrentFile, TorrentSnapshot, find_stuck_nfos
 from backend.core.repair import RepairStatus, TorrentRepairService
 
-
 VIDEO_SIZE = 8_000_000_000
 
 
@@ -58,9 +57,7 @@ def test_detects_incomplete_nfo_only_when_video_is_nearly_complete() -> None:
     assert missing[0].torrent_hash == "deadbeef"
     assert missing[0].torrent_name == "Release.Name.2026-GROUP"
     assert missing[0].file_index == 7
-    assert missing[0].relative_path == PurePosixPath(
-        "Release.Name/Release.Name.nfo"
-    )
+    assert missing[0].relative_path == PurePosixPath("Release.Name/Release.Name.nfo")
     assert missing[0].reported_path == PurePosixPath(
         "/data/cross-seeds/Release.Name/Release.Name.nfo"
     )
@@ -150,9 +147,8 @@ class FakeQBit:
             return self.states.pop(0)
         return self.states[0]
 
-    async def resume(self, torrent_hash: str) -> TorrentSnapshot:
+    async def resume(self, torrent_hash: str) -> TorrentSnapshot | None:
         self.events.append(("resume", torrent_hash))
-        assert self.resumed_state is not None
         return self.resumed_state
 
 
@@ -185,6 +181,7 @@ def make_service(
     clock: FakeClock,
     dry_run: bool = False,
     keep_mismatch: bool = True,
+    recheck_timeout: float = 2.0,
 ) -> TorrentRepairService:
     return TorrentRepairService(
         crowdnfo=crowdnfo,
@@ -192,7 +189,7 @@ def make_service(
         path_mapper=FakePathMapper(local_data),
         atomic_writer=writer,
         poll_interval=1.0,
-        recheck_timeout=2.0,
+        recheck_timeout=recheck_timeout,
         sleep=clock.sleep,
         monotonic=clock.monotonic,
         dry_run=dry_run,
@@ -244,6 +241,137 @@ async def test_repair_writes_expected_path_then_rechecks_resumes_and_seeds(
         "resume",
     ]
     assert events[2] == ("priority", "deadbeef", [7], 1)
+
+
+@pytest.mark.asyncio
+async def test_repair_waits_for_recheck_to_start_before_judging_a_mismatch(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    qbit = FakeQBit(
+        [
+            make_snapshot(state="stalledDL"),
+            checking_snapshot(),
+            checked_snapshot(matched=True),
+        ],
+        events,
+        resumed_state=seeding_snapshot(),
+    )
+    service = make_service(
+        local_data=tmp_path / "data",
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(b"exact nfo", events),
+        writer=RecordingWriter(events),
+        clock=clock,
+        recheck_timeout=5.0,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert result.status is RepairStatus.SUCCESS
+    assert result.verified is True
+    assert [event[0] for event in events].count("poll") == 3
+    assert clock.value == 2.0
+
+
+@pytest.mark.asyncio
+async def test_repair_polls_after_resume_until_torrent_is_seeding(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    qbit = FakeQBit(
+        [
+            checking_snapshot(),
+            checked_snapshot(matched=True),
+            checked_snapshot(matched=True),
+            seeding_snapshot(),
+        ],
+        events,
+        resumed_state=None,
+    )
+    service = make_service(
+        local_data=tmp_path / "data",
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(b"exact nfo", events),
+        writer=RecordingWriter(events),
+        clock=clock,
+        recheck_timeout=5.0,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert result.status is RepairStatus.SUCCESS
+    assert result.verified is True
+    assert result.seeding is True
+    assert [event[0] for event in events].count("poll") == 4
+    assert clock.value >= 2.0
+
+
+@pytest.mark.asyncio
+async def test_repair_only_reports_seeding_timeout_after_polling_to_deadline(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    qbit = FakeQBit(
+        [
+            checking_snapshot(),
+            checked_snapshot(matched=True),
+            checked_snapshot(matched=True),
+        ],
+        events,
+        resumed_state=None,
+    )
+    service = make_service(
+        local_data=tmp_path / "data",
+        qbit=qbit,
+        crowdnfo=FakeCrowdNFO(b"exact nfo", events),
+        writer=RecordingWriter(events),
+        clock=clock,
+        recheck_timeout=3.0,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert result.status is RepairStatus.TIMEOUT
+    assert result.verified is True
+    assert result.seeding is False
+    assert result.retryable is True
+    assert clock.value >= 3.0
+    assert [event[0] for event in events].count("poll") >= 5
+
+
+@pytest.mark.asyncio
+async def test_disabled_auto_recheck_places_nfo_without_claiming_verified_success(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    local_data = tmp_path / "data"
+    target = local_data / "cross-seeds/Release.Name/Release.Name.nfo"
+    clock = FakeClock()
+    service = TorrentRepairService(
+        crowdnfo=FakeCrowdNFO(b"exact nfo", events),
+        qbit=FakeQBit([], events),
+        path_mapper=FakePathMapper(local_data),
+        atomic_writer=RecordingWriter(events),
+        poll_interval=1.0,
+        recheck_timeout=3.0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+        auto_recheck=False,
+    )
+
+    result = await service.repair(find_stuck_nfos(make_snapshot())[0])
+
+    assert target.read_bytes() == b"exact nfo"
+    assert result.status is not RepairStatus.SUCCESS
+    assert result.verified is False
+    assert result.seeding is False
+    assert "recheck" not in [event[0] for event in events]
+    assert "poll" not in [event[0] for event in events]
+    assert "resume" not in [event[0] for event in events]
 
 
 @pytest.mark.asyncio
